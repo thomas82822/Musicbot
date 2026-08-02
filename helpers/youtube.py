@@ -1603,7 +1603,17 @@ async def _resolve_stream(
     #    starts playing as soon as the first audio frames arrive, without
     #    waiting for the full file.
     skip_cdn = force_refresh or _cdn_blocked
-    if skip_cdn and _pipe_failures.get(url, 0) == 0:
+    # ── CLOUD HOST FIX ───────────────────────────────────────────────────────
+    # On Heroku/Railway/Render/Fly.io the YouTube CDN is IP-blocked. yt-dlp's
+    # FIFO pipe can only deliver the first ~1 MB (one DASH segment) before the
+    # connection is dropped, causing a premature stream_end after ~10 s.
+    # Trying the pipe on the first attempt wastes those 10 s and floods logs
+    # with ntgcalls "Reached end of file" warnings.
+    #
+    # Fix: skip the pipe path entirely on known cloud hosts. Go straight to
+    # the local-download path which uses curl_cffi's Chrome TLS fingerprint
+    # and does not suffer from the CDN IP block.
+    if skip_cdn and _pipe_failures.get(url, 0) == 0 and not _ON_CLOUD_HOST:
         reason = "force_refresh" if force_refresh else "cdn_blocked"
         log.info("⚡ skip_cdn=%s | immediate pipe playback | %s", reason, url[:60])
 
@@ -1639,14 +1649,12 @@ async def _resolve_stream(
         return pipe_path, None, 0, {}
 
     if skip_cdn:
-        # The same URL already failed through a FIFO. Repeating that path
-        # creates an endless "play → EOF → retry 1/2" loop. Downloading to a
-        # local file lets yt-dlp finish its transfer and gives PyTgCalls a
-        # stable, seekable input.
-        log.warning(
-            "📥 Pipe previously failed; switching to local download | %s",
-            url[:80],
-        )
+        if _ON_CLOUD_HOST and _pipe_failures.get(url, 0) == 0:
+            # Cloud host, first attempt — pipe skipped by design.
+            log.info("☁️ Cloud host detected — skipping pipe, using local download | %s", url[:80])
+        else:
+            # Pipe already failed for this URL — fall back to full local download.
+            log.warning("📥 Pipe previously failed; switching to local download | %s", url[:80])
         local_path, dur = await loop.run_in_executor(
             _exec, _download_audio_sync, url, not is_video
         )
