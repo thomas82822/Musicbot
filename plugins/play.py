@@ -605,14 +605,31 @@ async def _play_next_inner(chat_id: int):
 
 def _ffmpeg_params(url: str) -> str:
     """
-    Return FFmpeg reconnect flags ONLY for HTTP/HTTPS streams.
-    LOCAL FILE FIX: -reconnect_streamed causes FFmpeg to hang indefinitely
-    when the input is a local file path (no network to reconnect to).
-    yt-dlp downloads to /tmp/apex_dl_xxx/audio.mp4 on cloud hosts — passing
-    reconnect flags to those paths is the root cause of the /play freeze.
+    Return FFmpeg flags for the given stream URL.
+
+    HTTP/HTTPS streams: reconnect flags so ffmpeg recovers from transient drops.
+
+    FIFO pipe streams (/tmp/apex_pipe_*): -re flag (read at native frame rate).
+      ROOT CAUSE of 2x/6x speed bug on FIFO pipes:
+        F_SETPIPE_SZ=4096 limits the kernel pipe BUFFER to 4 KB, but does not
+        limit ffmpeg's DECODE rate.  ffmpeg decodes WebM/Opus 10-20x faster than
+        real-time, drains the 4 KB buffer in microseconds, the writer immediately
+        refills it (yt-dlp downloads at full network speed), and the cycle repeats
+        → NTgCalls receives audio frames faster than real-time → song plays at 2-6x speed.
+      Fix: -re tells ffmpeg to read its input at the stream's native frame rate
+        (based on the WebM timestamps). ffmpeg sleeps between reads to maintain
+        1x rate → the writer blocks on FIFO write → yt-dlp download is naturally
+        paced. Audio plays at EXACTLY the correct speed from byte 0.
+      Note: -re is placed before -i (input flag position) in pytgcalls/NTgCalls,
+        so it correctly applies to the FIFO input, not the output.
+
+    Local downloaded files (/tmp/apex_dl_*): no flags.
+      -reconnect_streamed on a local path hangs ffmpeg indefinitely (no network).
     """
     if url.startswith("http://") or url.startswith("https://"):
         return "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    if "/apex_pipe_" in url:
+        return "-re"
     return ""
 
 
