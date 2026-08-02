@@ -40,12 +40,27 @@ from helpers.decorators import admin_only
 log = logging.getLogger("ApexBot.play")
 
 # ── Per-chat state ────────────────────────────────────────────────────────────
-_loop:       dict[int, bool]     = {}
-_paused:     dict[int, bool]     = {}   # UI-only: drives Pause/Resume button label
-_volume:     dict[int, int]      = {}
-_start_time: dict[int, float]    = {}   # epoch when current song started
-_np_message: dict[int, Message]  = {}   # last sent now-playing message, for in-place edits
-_extra_cache: dict[int, str]     = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
+_loop:            dict[int, bool]     = {}
+_paused:          dict[int, bool]     = {}   # UI-only: drives Pause/Resume button label
+_volume:          dict[int, int]      = {}
+_start_time:      dict[int, float]    = {}   # epoch when current song started
+_np_message:      dict[int, Message]  = {}   # last sent now-playing message, for in-place edits
+_extra_cache:     dict[int, str]      = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
+_silence_playing: dict[int, bool]     = {}
+# ↑ SILENCE RACE FIX: True while the instant-join silence stream is active.
+#
+# Root cause: NTgCalls reads local MP3 files faster than real-time during
+# its pipeline init window (~1-2s).  A 4-second silence file is consumed
+# in ~1.5 s → stream_end fires BEFORE the song search completes.
+# on_stream_end calls _play_next → queue is empty → bot leaves VC prematurely.
+# 0.2 s later, the song is found → _stream_song rejoins VC.  This causes an
+# unnecessary leave+rejoin blip and can race with change_stream.
+#
+# Fix: set this flag True in _join_vc_early, check it in on_stream_end.
+# If True, the silence stream ended early — ignore stream_end and let the
+# /play command's _stream_song call handle the VC transition directly.
+# The flag is cleared in _stream_song (real song starts) and _join_vc_early
+# cleanup paths.
 
 # Support link from config
 try:
@@ -126,14 +141,19 @@ async def _join_vc_early(chat_id: int) -> bool:
     try:
         from pytgcalls.types import MediaStream, AudioQuality
         sstream = MediaStream(silence, audio_parameters=AudioQuality.STUDIO)
+        # Mark silence as active BEFORE play() so on_stream_end can see it
+        # even if NTgCalls reads the file instantly (speed-bug scenario).
+        _silence_playing[chat_id] = True
         await asyncio.wait_for(call_py.play(chat_id, sstream), timeout=8.0)
         log.debug("✅ Early VC join done for %d", chat_id)
         return True
     except asyncio.TimeoutError:
         log.debug("Early VC join timed out for %d", chat_id)
+        _silence_playing.pop(chat_id, None)
         return False
     except Exception as e:
         log.debug("Early VC join: %s", e)
+        _silence_playing.pop(chat_id, None)
         return False
 
 
@@ -415,6 +435,10 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
     try:
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
 
+        # SILENCE RACE FIX — clear the silence flag so that when the real song's
+        # stream eventually ends, on_stream_end will call _play_next normally.
+        _silence_playing.pop(chat_id, None)
+
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
 
@@ -515,7 +539,18 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
 if call_py:
     @call_py.on_update(tgcalls_filters.stream_end())
     async def on_stream_end(_, update):
-        await _play_next(update.chat_id)
+        cid = update.chat_id
+        # SILENCE RACE FIX — If the silence stream ended (NTgCalls reads local
+        # MP3 at CPU speed → 4-s silence consumed in ~1.5 s), ignore this
+        # stream_end event.  The /play command is still resolving the song URL
+        # in parallel; _stream_song will call play()/change_stream() to start
+        # the real song as soon as the URL is ready.  Calling _play_next here
+        # would pop an empty queue → leave_group_call → bot leaves VC → then
+        # _stream_song has to rejoin 0.2 s later, causing a blip.
+        if _silence_playing.pop(cid, False):
+            log.debug("⏩ stream_end for silence ignored — real song pending | %d", cid)
+            return
+        await _play_next(cid)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
