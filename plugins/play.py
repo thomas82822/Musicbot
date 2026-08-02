@@ -47,18 +47,26 @@ _start_time:      dict[int, float]         = {}   # epoch when current song star
 _np_message:      dict[int, Message]       = {}   # last sent now-playing message, for in-place edits
 _extra_cache:     dict[int, str]           = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
 _silence_playing: dict[int, bool]          = {}
-_play_next_locks: dict[int, asyncio.Lock]  = {}
-# ↑ MEMORY/R14 FIX: per-chat mutex for _play_next.
+_play_next_locks:    dict[int, asyncio.Lock]  = {}
+_stream_changed_at:  dict[int, float]         = {}
+# ↑ MEMORY/R14 FIX: per-chat mutex + stream-transition cooldown for _play_next.
 #
-# Root cause: when a pipe stream ends prematurely (CDN block on Heroku),
-# NTgCalls emits multiple stream_end events in rapid succession for the same
-# chat.  Each event dispatches _play_next concurrently — every concurrent call
-# detects "elapsed < 30 s" and launches its own yt-dlp download process for
-# the same URL.  With 8-10 parallel yt-dlp workers downloading a 4-6 MB audio
-# file, the dyno's memory spikes to 1.5 GB+ → R14 (quota exceeded) → restart.
+# Root cause A (fixed): NTgCalls fires 8-10 stream_end events in rapid
+# succession on a pipe failure → parallel yt-dlp spawns → 1.5 GB RAM → R14.
+# Fix: per-chat Lock; if _play_next is already running, duplicates return early.
 #
-# Fix: each chat_id gets a single asyncio.Lock.  If _play_next is already
-# running for that chat, subsequent calls skip immediately instead of stacking.
+# Root cause B (this fix): after the pipe-fail retry, NTgCalls fires 4 more
+# "Reached end of file" events (old pipe stream cleanup) 60-70 ms after
+# change_stream returns — right after the lock is released.  These enter
+# _play_next_inner with elapsed ≈ 0 s (timer just reset by _stream_song),
+# trigger a second retry, and eventually call leave_group_call on the live
+# call → "Call not found, already removed" warning + dropped playback.
+#
+# Fix: _stream_song stamps _stream_changed_at[chat_id] = now().
+# _play_next checks the stamp and drops stream_end events that arrive within
+# _STREAM_TRANSITION_GRACE seconds (5 s) of the last stream change.
+# Legitimate next-song events (natural end of a full song) arrive much later.
+_STREAM_TRANSITION_GRACE = 5.0   # seconds to suppress stream_end after change_stream
 # ↑ SILENCE RACE FIX: True while the instant-join silence stream is active.
 #
 # Root cause: NTgCalls reads local MP3 files faster than real-time during
@@ -400,6 +408,16 @@ async def _play_next(chat_id: int):
     # concurrent call enters the pipe-retry path and spawns its own yt-dlp
     # process → 8-10 parallel downloads → 1.5 GB RAM → R14 crash.
     # If _play_next is already running for this chat, skip the duplicate call.
+    # Drop stream_end events that arrive within the grace window after a
+    # stream change — they are stale cleanup events from the old stream.
+    grace_age = time.time() - _stream_changed_at.get(chat_id, 0.0)
+    if grace_age < _STREAM_TRANSITION_GRACE:
+        log.debug(
+            "_play_next grace-drop for %d — %.2fs since last stream change (< %.0fs grace)",
+            chat_id, grace_age, _STREAM_TRANSITION_GRACE,
+        )
+        return
+
     if chat_id not in _play_next_locks:
         _play_next_locks[chat_id] = asyncio.Lock()
     lock = _play_next_locks[chat_id]
@@ -466,6 +484,7 @@ async def _play_next_inner(chat_id: int):
         if not next_song:
             set_current(chat_id, None)
             _start_time.pop(chat_id, None)
+            _stream_changed_at.pop(chat_id, None)
             _paused.pop(chat_id, None)
             _extra_cache.pop(chat_id, None)
             try:
@@ -527,6 +546,11 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
             )
 
         await _try_play_or_change(chat_id, stream, prefer_change=already_in_vc)
+
+        # ── STREAM TRANSITION GRACE STAMP ───────────────────────────────────
+        # Record the moment change_stream/play returned so _play_next can
+        # suppress stale "Reached end of file" events from the old stream.
+        _stream_changed_at[chat_id] = time.time()
 
         # ── SILENCE RACE FIX (corrected placement) ──────────────────────────
         # The silence MP3 is consumed by ntgcalls faster than real-time
@@ -694,6 +718,7 @@ async def np_callback(client: Client, query: CallbackQuery):
         _loop.pop(chat_id, None)
         _paused.pop(chat_id, None)
         _start_time.pop(chat_id, None)
+        _stream_changed_at.pop(chat_id, None)
         _extra_cache.pop(chat_id, None)
         _np_message.pop(chat_id, None)
         _play_next_locks.pop(chat_id, None)
@@ -1044,6 +1069,7 @@ async def stop(_, message: Message):
     set_current(chat_id, None)
     _loop.pop(chat_id, None)
     _start_time.pop(chat_id, None)
+    _stream_changed_at.pop(chat_id, None)
     _play_next_locks.pop(chat_id, None)
     if call_py:
         try:
