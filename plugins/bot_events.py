@@ -37,10 +37,11 @@ async def on_new_chat_member(client: Client, message: Message):
         if adder.last_name:
             adder_name += f" {adder.last_name}"
         adder_name = adder_name.strip() or f"User {adder.id}"
+        adder_username = adder.username or ""
 
-        # Store in DB
+        # Store in DB (with username for NP card display)
         from database import set_chat_adder, register_chat
-        await set_chat_adder(chat.id, adder.id, adder_name)
+        await set_chat_adder(chat.id, adder.id, adder_name, adder_username)
         await register_chat(chat.id, chat.title or "", str(chat.type))
 
         log.info(
@@ -57,7 +58,10 @@ async def on_new_chat_member(client: Client, message: Message):
                 invite = link or ""
             except Exception:
                 pass
-            log_bot_added(chat.id, chat.title or "", invite, str(chat.type))
+            log_bot_added(chat.id, chat.title or "", invite, str(chat.type),
+                          adder_id=adder.id,
+                          adder_username=getattr(adder, 'username', '') or '',
+                          adder_name=adder_name)
         except Exception as _e:
             log.debug("log_bot_added failed: %s", _e)
 
@@ -105,9 +109,10 @@ try:
                 if adder.last_name:
                     adder_name += f" {adder.last_name}"
                 adder_name = adder_name.strip() or f"User {adder.id}"
+                adder_username = adder.username or ""
 
                 from database import set_chat_adder, register_chat
-                await set_chat_adder(chat.id, adder.id, adder_name)
+                await set_chat_adder(chat.id, adder.id, adder_name, adder_username)
                 await register_chat(chat.id, chat.title or "", str(chat.type))
 
                 log.info(
@@ -117,7 +122,10 @@ try:
 
                 try:
                     from helpers.logger_channel import log_bot_added
-                    log_bot_added(chat.id, chat.title or "", "", str(chat.type))
+                    log_bot_added(chat.id, chat.title or "", "", str(chat.type),
+                                  adder_id=getattr(adder, 'id', 0),
+                                  adder_username=getattr(adder, 'username', '') or '',
+                                  adder_name=adder_name)
                 except Exception:
                     pass
 

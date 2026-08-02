@@ -1673,7 +1673,7 @@ async def _resolve_stream(
     # Fix: skip the pipe path entirely on known cloud hosts. Go straight to
     # the local-download path which uses curl_cffi's Chrome TLS fingerprint
     # and does not suffer from the CDN IP block.
-    if skip_cdn and _pipe_failures.get(url, 0) == 0 and not _ON_CLOUD_HOST:
+    if skip_cdn and _pipe_failures.get(url, 0) == 0:
         reason = "force_refresh" if force_refresh else "cdn_blocked"
         log.info("⚡ skip_cdn=%s | immediate pipe playback | %s", reason, url[:60])
 
@@ -1705,22 +1705,18 @@ async def _resolve_stream(
         #
         # Duration is unknown until yt-dlp finishes; NP card will show 0:00
         # briefly, which is acceptable. Do NOT cache FIFO paths — one-use only.
-        log.info("⚡ Pipe path ready | %s", pipe_path)
+        log.info("⚡ Pipe path ready (streaming while downloading) | %s", pipe_path)
         return pipe_path, None, 0, {}
 
     if skip_cdn:
-        if _ON_CLOUD_HOST and _pipe_failures.get(url, 0) == 0:
-            # Cloud host, first attempt — pipe skipped by design.
-            log.info("☁️ Cloud host detected — skipping pipe, using local download | %s", url[:80])
-        else:
-            # Pipe already failed for this URL — fall back to full local download.
-            log.warning("📥 Pipe previously failed; switching to local download | %s", url[:80])
+        # Pipe previously failed for this URL — fall back to full local download.
+        log.warning("📥 Pipe failed; switching to local download | %s", url[:80])
         local_path, dur = await loop.run_in_executor(
             _exec, _download_audio_sync, url, not is_video
         )
         if local_path:
             return local_path, None, dur, {}
-        raise Exception(f"❌ Pipe and local download failed: {url[:60]}")
+        raise Exception(f"❌ Local download failed: {url[:60]}")
 
     # ── Normal path: CDN not known-blocked (VPS / home server) ───
     # Race yt-dlp signed URL against Invidious. Falls back to local download

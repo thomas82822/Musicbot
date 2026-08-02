@@ -165,10 +165,11 @@ async def init_db():
             PRIMARY KEY(chat_id, key)
         );
         CREATE TABLE IF NOT EXISTS chat_adders (
-            chat_id   INTEGER PRIMARY KEY,
-            user_id   INTEGER DEFAULT 0,
-            user_name TEXT    DEFAULT '',
-            added_at  INTEGER DEFAULT (strftime('%s','now'))
+            chat_id        INTEGER PRIMARY KEY,
+            user_id        INTEGER DEFAULT 0,
+            user_name      TEXT    DEFAULT '',
+            user_username  TEXT    DEFAULT '',
+            added_at       INTEGER DEFAULT (strftime('%s','now'))
         );
         """)
         # ── Indexes for fast lookups on hot query paths ───────────────
@@ -1741,14 +1742,19 @@ async def delete_playlist(user_id: int, name: str) -> bool:
 
 # ══ CHAT ADDERS (My Cute Owner per GC) ════════════════════════════
 
-async def set_chat_adder(chat_id: int, user_id: int, user_name: str):
-    """Store who added the bot to a specific group."""
+async def set_chat_adder(chat_id: int, user_id: int, user_name: str, user_username: str = ""):
+    """Store who added the bot to a specific group (username+id bhi store karo)."""
     import time
     async with aiosqlite.connect(DB) as db:
+        try:
+            await db.execute("ALTER TABLE chat_adders ADD COLUMN user_username TEXT DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass
         await db.execute(
-            "INSERT OR REPLACE INTO chat_adders (chat_id, user_id, user_name, added_at) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, user_name, int(time.time()))
+            "INSERT OR REPLACE INTO chat_adders (chat_id, user_id, user_name, user_username, added_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, user_id, user_name, user_username, int(time.time()))
         )
         await db.commit()
 
@@ -1761,3 +1767,24 @@ async def get_chat_adder(chat_id: int) -> str | None:
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
+
+
+async def get_chat_adder_full(chat_id: int) -> tuple | None:
+    """Return (user_id, user_username, user_name) or None."""
+    async with aiosqlite.connect(DB) as db:
+        try:
+            async with db.execute(
+                "SELECT user_id, user_username, user_name FROM chat_adders WHERE chat_id=?",
+                (chat_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return (int(row[0]), str(row[1] or ""), str(row[2] or "")) if row else None
+        except Exception:
+            try:
+                async with db.execute(
+                    "SELECT user_id, user_name FROM chat_adders WHERE chat_id=?", (chat_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    return (int(row[0]), "", str(row[1] or "")) if row else None
+            except Exception:
+                return None

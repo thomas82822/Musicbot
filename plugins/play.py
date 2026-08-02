@@ -100,12 +100,27 @@ async def _safe_get_autoplay(chat_id: int) -> bool:
 
 
 async def _safe_get_adder(chat_id: int) -> str:
-    """Read per-chat 'My Cute Owner' name; returns '' on any error."""
+    """Read per-chat adder info; returns formatted 'name | @username · id' string."""
     try:
-        from database import get_chat_adder
-        return await get_chat_adder(chat_id) or ""
+        from database import get_chat_adder_full
+        info = await get_chat_adder_full(chat_id)
+        if not info:
+            return ""
+        uid, uname, uname_full = info
+        parts = []
+        if uname_full:
+            parts.append(uname_full)
+        if uname:
+            parts.append(f"@{uname}")
+        if uid:
+            parts.append(f"<code>{uid}</code>")
+        return " · ".join(parts) if parts else ""
     except Exception:
-        return ""
+        try:
+            from database import get_chat_adder
+            return await get_chat_adder(chat_id) or ""
+        except Exception:
+            return ""
 
 # ── Silence file — for instant VC join ───────────────────────────────────────
 _SILENCE_PATH: str | None = None
@@ -243,25 +258,37 @@ def _make_caption(
     autoplay_on: bool = False,
 ) -> str:
     """
-    HTML blockquote caption with premium emoji formatting:
-      🎵 NOW PLAYING | GroupName
+    Telegram blockquote (expandable) NOW PLAYING card with premium emojis.
+    Format:
+      [ 🎵 NOW PLAYING 🎶           ← expandable blockquote header
+        🏠 GroupName ]
       🌀 TITLE : ...
       🌀 DURATION : ...
       🌀 BY : ...
       🎲 AUTOPLAY : ON/OFF
-      🌸 My Cute Owner : AdderName  (per-GC)
-      🎧 UP NEXT / 🎲 AUTOPLAY SUGGESTIONS  (below, own blockquote)
+      🌸 My Cute Owner : name · @username · id
+      🎧 UP NEXT / 🎲 AUTOPLAY SUGGESTIONS
     """
+    try:
+        from helpers.premium_emojis import _apply_premium_emojis as _pe
+    except Exception:
+        _pe = lambda x: x
+
     title  = song.title or "Unknown"
     req_by = song.requested_by or "Unknown"
-    gc_line = f" <b>{chat_title}</b>" if chat_title else ""
+
+    # Expandable blockquote header (Telegram collapses long ones by default)
+    header_inner = f"🎵 <b>NOW PLAYING</b> 🎶"
+    if chat_title:
+        header_inner += f"\n🏠 <b>{chat_title}</b>"
+    autoplay_status = "<b>ON ✅</b>" if autoplay_on else "OFF"
 
     cap = (
-        f"<blockquote>🎵 <b>NOW PLAYING</b>{gc_line}</blockquote>\n\n"
+        f"<blockquote expandable>{header_inner}</blockquote>\n\n"
         f"🌀 <b>TITLE</b> : {title}\n"
         f"🌀 <b>DURATION</b> : {dur}\n"
         f"🌀 <b>BY</b> : {req_by}\n"
-        f"🎲 <b>AUTOPLAY</b> : {'ON' if autoplay_on else 'OFF'}"
+        f"🎲 <b>AUTOPLAY</b> : {autoplay_status}"
     )
 
     if adder_name:
@@ -270,7 +297,7 @@ def _make_caption(
     if extra_block:
         cap += f"\n\n<blockquote>{extra_block}</blockquote>"
 
-    return cap
+    return _pe(cap)
 
 
 def _make_keyboard(chat_id: int, paused: bool = False, loop_on: bool = False, autoplay_on: bool = False) -> InlineKeyboardMarkup:
@@ -691,18 +718,27 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
     prefer_change=True → attempt change_stream first (when early join is known
     to have succeeded) so we skip the guaranteed-to-fail play() round-trip.
 
+    BUG FIX: Newer pytgcalls GitHub builds may not expose change_stream as an
+    attribute (renamed or removed in some commit windows).  Runtime check via
+    getattr() + fallback to play() ensures the bot never crashes with
+    'PyTgCalls object has no attribute change_stream'.
+
     Each call is wrapped in a 20 s timeout so a hung pytgcalls/NTgCalls call
     never freezes the bot permanently.
     """
-    if prefer_change:
+    _change_stream = getattr(call_py, 'change_stream', None)
+
+    if prefer_change and _change_stream:
         try:
             await asyncio.wait_for(
-                call_py.change_stream(chat_id, stream),
+                _change_stream(chat_id, stream),
                 timeout=_PLAY_TIMEOUT,
             )
             return
         except asyncio.TimeoutError:
             log.warning("_try_play_or_change: change_stream timed out for %d — retrying via play()", chat_id)
+        except AttributeError:
+            log.warning("change_stream not available in this pytgcalls build — using play() only")
         except Exception:
             pass  # Wasn't in VC after all — try play() below
     try:
@@ -712,15 +748,18 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
         )
     except asyncio.TimeoutError:
         log.warning("_try_play_or_change: play() timed out for %d — trying change_stream()", chat_id)
-        await asyncio.wait_for(
-            call_py.change_stream(chat_id, stream),
-            timeout=_PLAY_TIMEOUT,
-        )
+        if _change_stream:
+            await asyncio.wait_for(_change_stream(chat_id, stream), timeout=_PLAY_TIMEOUT)
+        else:
+            # No change_stream — retry play() with a brief delay
+            await asyncio.sleep(0.5)
+            await asyncio.wait_for(call_py.play(chat_id, stream), timeout=_PLAY_TIMEOUT)
     except Exception:
-        await asyncio.wait_for(
-            call_py.change_stream(chat_id, stream),
-            timeout=_PLAY_TIMEOUT,
-        )
+        if _change_stream:
+            await asyncio.wait_for(_change_stream(chat_id, stream), timeout=_PLAY_TIMEOUT)
+        else:
+            # Newer pytgcalls: play() handles both joining and stream switching
+            await asyncio.wait_for(call_py.play(chat_id, stream), timeout=_PLAY_TIMEOUT)
 
 
 # Register stream-end handler

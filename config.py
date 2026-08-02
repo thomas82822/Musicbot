@@ -38,7 +38,7 @@ SESSION_STRING  = os.environ.get("SESSION_STRING", "").strip()
 OWNER_ID        = _env_int("OWNER_ID")
 OWNER_USERNAME  = os.environ.get("OWNER_USERNAME", "").strip()
 # Log channel — 100x detailed event logging goes here
-LOG_CHANNEL     = _env_int("LOG_CHANNEL", -1004229474573)
+LOG_CHANNEL     = _env_int("LOG_CHANNEL", -1004334848663)
 SUPPORT_CHAT    = os.environ.get("SUPPORT_CHAT", "https://t.me/ApexAssociation")
 SUDO_USERS      = [OWNER_ID] if OWNER_ID else []
 

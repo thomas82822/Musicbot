@@ -100,17 +100,25 @@ def log_shutdown():
     asyncio.create_task(_run())
 
 
-def log_bot_added(chat_id: int, chat_title: str, chat_invite: str = "", chat_type: str = "group"):
-    """Log when bot is added to a new group."""
+def log_bot_added(chat_id: int, chat_title: str, chat_invite: str = "", chat_type: str = "group",
+                   adder_id: int = 0, adder_username: str = "", adder_name: str = ""):
+    """Log when bot is added to a new group — with full adder info."""
     async def _run():
         invite_line = f"\n🔗 **Invite Link:** {chat_invite}" if chat_invite else ""
+        adder_uname = f"@{adder_username}" if adder_username else "N/A"
+        adder_line = (
+            f"\n\n👤 **Added By:** {adder_name or 'Unknown'}\n"
+            f"   • Username: {adder_uname}\n"
+            f"   • ID: `{adder_id}`"
+        ) if adder_id else ""
         text = (
             "🤖 **BOT ADDED TO NEW GROUP**\n"
-            f"{'─'*32}\n\n"
+            f"{'━'*32}\n\n"
             f"🏠 **Group:** `{chat_title}`\n"
             f"🆔 **Chat ID:** `{chat_id}`\n"
             f"📦 **Type:** `{chat_type}`\n"
             f"🕐 **Time:** `{_ts()}`"
+            f"{adder_line}"
             f"{invite_line}\n\n"
             f"✅ Bot is now active in this group!\n"
             f"💡 Use `/help` to see all commands."
