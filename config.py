@@ -107,7 +107,7 @@ SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()  # S
 OPENWEATHER_KEY       = os.environ.get("OPENWEATHER_KEY", "").strip()        # /weather fallback (wttr.in used when empty)
 OMDB_API_KEY          = os.environ.get("OMDB_API_KEY", "").strip()           # /movie IMDB lookup
 GITHUB_TOKEN          = os.environ.get("GITHUB_TOKEN", "").strip()           # /github_info rate-limit bypass
-BOT_REPO              = os.environ.get("BOT_REPO", "thomasir/4st_music").strip()  # owner panel GitHub backup
+BOT_REPO              = os.environ.get("BOT_REPO", "thomas82822/Musicbot").strip()  # owner panel GitHub backup
 GENIUS_KEY            = os.environ.get("GENIUS_KEY", "").strip()             # /lyrics Genius fallback
 
 # ── Queue settings ─────────────────────────────────────────────────

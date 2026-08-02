@@ -40,6 +40,18 @@ for _d in _FFMPEG_CANDIDATES:
         os.environ["PATH"] = _d + ":" + os.environ.get("PATH", "")
         break
 
+# Deno PATH fix — bgutil yt-dlp PO-token provider runs `deno run` at runtime.
+# post_compile installs Deno to vendor/deno/bin; add it to PATH so the bgutil
+# plugin's Deno subprocess can be found when generating PO-tokens.
+_DENO_CANDIDATES = [
+    os.path.join(_HERE, "vendor", "deno", "bin"),     # post_compile install
+    "/app/vendor/deno/bin",                            # explicit Heroku path
+]
+for _d in _DENO_CANDIDATES:
+    if os.path.isdir(_d) and _d not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _d + ":" + os.environ.get("PATH", "")
+        break
+
 # Fallback: use static-ffmpeg Python package if ffprobe is still not in PATH.
 # This handles VPS / Railway / Render / any non-Heroku host where the vendor
 # directory doesn't exist and ffmpeg isn't pre-installed.
@@ -57,7 +69,11 @@ logging.basicConfig(
 )
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("pytgcalls").setLevel(logging.WARNING)
-logging.getLogger("ntgcalls").setLevel(logging.WARNING)
+# ERROR level: ntgcalls "Reached end of the file" warnings (shell_reader.cpp:40)
+# are normal EOF signals from NTgCalls when it finishes reading a local audio/
+# silence file. They are NOT stream failures — pytgcalls fires the on_stream_end
+# callback separately. Suppressing them at WARNING keeps logs clean.
+logging.getLogger("ntgcalls").setLevel(logging.ERROR)
 
 log = logging.getLogger("ApexBot")
 
