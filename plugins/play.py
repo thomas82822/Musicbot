@@ -96,7 +96,11 @@ _STREAM_TRANSITION_GRACE = 5.0   # seconds to suppress stream_end after change_s
 # suspiciously fast, re-resolve a fresh pipe/stream and retry the same song
 # a bounded number of times before giving up and advancing normally.
 _stream_retries: dict[int, int]  = {}
-_PREMATURE_END_THRESHOLD = 3.0   # seconds — below this, stream_end is treated as a failed pipe, not a finished song
+_PREMATURE_END_THRESHOLD = 6.0   # seconds — below this, stream_end is treated as a failed pipe, not a finished song
+    # BUG FIX: raised 3.0 → 6.0 to cover the _STREAM_TRANSITION_GRACE (5s) dead zone.
+    # Old value (3.0) < grace window (5.0): stream_end between 3–5s was silently
+    # dropped (not premature → not retried; within grace → dropped by _play_next),
+    # leaving bot muted in VC with no stream. Now any stream_end < 6s triggers retry.
 _MAX_STREAM_RETRIES      = 2
 
 # Support link from config
