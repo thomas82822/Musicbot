@@ -445,7 +445,7 @@ async def _fetch_autoplay_song(chat_id: int, prev: Song | None) -> Song | None:
     return None
 
 
-async def _play_next(chat_id: int):
+async def _play_next(chat_id: int, force: bool = False):
     # ── MEMORY / R14 FIX: per-chat mutex ───────────────────────────────────────
     # NTgCalls can fire multiple stream_end events in quick succession for the
     # same chat (pipe-fail scenario on Heroku CDN block).  Without a lock every
@@ -454,13 +454,20 @@ async def _play_next(chat_id: int):
     # If _play_next is already running for this chat, skip the duplicate call.
     # Drop stream_end events that arrive within the grace window after a
     # stream change — they are stale cleanup events from the old stream.
-    grace_age = time.time() - _stream_changed_at.get(chat_id, 0.0)
-    if grace_age < _STREAM_TRANSITION_GRACE:
-        log.debug(
-            "_play_next grace-drop for %d — %.2fs since last stream change (< %.0fs grace)",
-            chat_id, grace_age, _STREAM_TRANSITION_GRACE,
-        )
-        return
+    #
+    # SKIP FIX: grace period check is for stream_end events only — NOT for
+    # manual user actions (skip button, /skip command, /stop command).
+    # Pass force=True from user-triggered callers to bypass the grace check.
+    # Without force=True, a manual skip fired within 5s of the last stream
+    # change is silently dropped → bot stays in VC without advancing.
+    if not force:
+        grace_age = time.time() - _stream_changed_at.get(chat_id, 0.0)
+        if grace_age < _STREAM_TRANSITION_GRACE:
+            log.debug(
+                "_play_next grace-drop for %d — %.2fs since last stream change (< %.0fs grace)",
+                chat_id, grace_age, _STREAM_TRANSITION_GRACE,
+            )
+            return
 
     if chat_id not in _play_next_locks:
         _play_next_locks[chat_id] = asyncio.Lock()
@@ -942,7 +949,7 @@ async def np_callback(client: Client, query: CallbackQuery):
         if not song:
             return await query.answer("Nothing to skip.", show_alert=True)
         await query.answer("⏭ Skipped.")
-        await _play_next(chat_id)  # refreshes the NP message internally
+        await _play_next(chat_id, force=True)  # force=True: bypass grace period for manual skip
 
     elif action == "stop":
         clear_queue(chat_id)
@@ -1291,7 +1298,7 @@ async def skip(_, message: Message):
         f"<blockquote>⏭ <b>Skipped {n} song{'s' if n > 1 else ''}!</b></blockquote>",
         parse_mode=enums.ParseMode.HTML,
     )
-    await _play_next(chat_id)
+    await _play_next(chat_id, force=True)  # force=True: user-triggered, bypass grace period
 
 
 @bot.on_message(filters.command(["stop", "end"]) & filters.group)

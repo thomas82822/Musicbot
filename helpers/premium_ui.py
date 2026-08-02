@@ -245,20 +245,25 @@ def install_premium_ui() -> None:
             - parse_mode removed hoti hai (entities aur parse_mode saath nahi chalte)
             - Agar koi exception aaye, silently pass-through karo
 
-            v7.2 FIX — HTML-formatted text (parse_mode=HTML or literal <b>/
-            <blockquote>/... tags) used to be skipped ENTIRELY here, because
-            entities + parse_mode can't be sent together and naively stripping
-            parse_mode would have shown raw HTML tags as plain text. That meant
-            every HTML-built caption — now-playing cards, /start, /help, error
-            replies, i.e. most of what a non-premium bot actually sends in a
-            user's DM — never got premium custom-emoji entities at all.
+            v7.3 FIX — Markdown text (admin.py, gban.py etc. ke plugins use karte hain
+            "**bold**", "> quote" syntax bina parse_mode=HTML ke) ka handling:
 
-            Fix: convert the HTML itself into (plain_text, entities) via
-            html_to_plain_and_entities(), which turns both the formatting tags
-            AND the emoji characters into MessageEntity objects. Only switch
-            the message over to entities-mode if that conversion actually
-            found premium emoji to inject — otherwise leave the original
-            HTML/parse_mode path untouched.
+            PROBLEM: Plugin "❌ **Ban nahi kar sakta!**\n> User admin hai." bhejta hai
+            bina parse_mode ke (Pyrogram default markdown). Pehla code:
+              1. looks_like_html=False (koi HTML tags nahi)
+              2. build_custom_emoji_entities("❌ **Ban...") → sirf ❌ ka CUSTOM_EMOJI entity
+              3. parse_mode remove hoti hai (entities set hone ki wajah se)
+              4. Message bheja jaata hai plain text — **bold** aur > quote GAYAB!
+
+            FIX: Markdown text (without HTML tags, with ** / __ / >) ko pehle HTML mein
+            convert karo (md_to_html), phir html_to_plain_and_entities se entities nikalo.
+            Isse BOLD + BLOCKQUOTE + CUSTOM_EMOJI entities saath milti hain.
+            Agar koi emoji na mile phir bhi, markdown → HTML convert karo aur
+            parse_mode=HTML set karo — formatting kabhi nahi jaati.
+
+            v7.2 FIX (preserved) — HTML-formatted text (parse_mode=HTML or literal <b>/
+            <blockquote>/... tags) ka bhi yahi treatment: html_to_plain_and_entities se
+            entities nikalo, had_emoji=True par entity mode, False par HTML mode.
             """
             if not isinstance(text, str) or not text:
                 return text
@@ -267,31 +272,61 @@ def install_premium_ui() -> None:
                 return text
 
             pm_is_html = False
+            pm_is_markdown = False
             try:
                 from pyrogram.enums import ParseMode
                 pm = kwargs.get("parse_mode")
                 pm_is_html = pm == ParseMode.HTML or (isinstance(pm, str) and pm.lower() == "html")
+                pm_is_markdown = (
+                    pm is None
+                    or pm == ParseMode.DEFAULT
+                    or pm == ParseMode.MARKDOWN
+                    or (isinstance(pm, str) and pm.lower() in ("markdown", "default", "md"))
+                )
             except Exception:
-                pass
+                pm_is_markdown = True  # safe default
 
             looks_like_html = bool(re.search(r"<[a-zA-Z/][^>]*>", text))
+            # Markdown indicators: bold, italic, blockquote, code, spoiler
+            _MD_RE = re.compile(r'\*\*|__|\|\||^> |```', re.MULTILINE)
+            looks_like_markdown = not looks_like_html and bool(_MD_RE.search(text))
 
             try:
                 if pm_is_html or looks_like_html:
+                    # Already HTML — extract formatting + emoji entities together
                     from helpers.custom_emoji_sender import html_to_plain_and_entities
                     final_text, entities, had_emoji = html_to_plain_and_entities(text)
                     if had_emoji:
                         kwargs["entities"] = entities
                         kwargs.pop("parse_mode", None)
-                        # FIX: Save original HTML so _degrade_payload can fall back
+                        # Save original HTML so _degrade_payload can fall back
                         # to HTML mode on error — preserving bold/blockquote/italic.
-                        # Without this, any entity rejection strips ALL formatting.
                         kwargs["_apex_orig_html"] = text
                         return final_text
                     # No premium emoji found in this HTML — leave it exactly
                     # as the caller built it (parse_mode=HTML keeps rendering).
                     return text
+
+                elif looks_like_markdown or pm_is_markdown:
+                    # Markdown text — convert to HTML first, then extract entities.
+                    # This preserves **bold**, __italic__, > blockquote, `code` as
+                    # MessageEntity objects alongside any CUSTOM_EMOJI entities.
+                    from helpers.premium_emojis import md_to_html
+                    from helpers.custom_emoji_sender import html_to_plain_and_entities
+                    html_text = md_to_html(text)
+                    final_text, entities, had_emoji = html_to_plain_and_entities(html_text)
+                    if entities:
+                        # Use entity mode — formatting + emojis both preserved
+                        kwargs["entities"] = entities
+                        kwargs.pop("parse_mode", None)
+                        kwargs["_apex_orig_html"] = html_text  # fallback to HTML on error
+                        return final_text
+                    # No entities at all — send as HTML (md_to_html already converted)
+                    kwargs["parse_mode"] = ParseMode.HTML
+                    return html_text
+
                 else:
+                    # Plain text with possible emojis but no markdown/HTML
                     from helpers.custom_emoji_sender import build_custom_emoji_entities
                     _, entities = build_custom_emoji_entities(text)
                     if entities:
