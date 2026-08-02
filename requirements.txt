@@ -1,0 +1,42 @@
+# ════════════════════════════════════════════════════════════════
+# 4ST Music Bot — Python Dependencies
+#
+# KEY FIX 1: pyrofork (GitHub) replaces pyrogram
+#   pyrofork >= 2.3.x khud `pyrogram` namespace mein install hota hai.
+#   Isme `InputGroupCallSlug` type bhi hai jo pytgcalls ko chahiye.
+#   Official pyrogram (PyPI) mein yeh type nahi hai — isliye Heroku crash karta tha.
+#
+# KEY FIX 2: pytgcalls GitHub se (v2.3.3)
+#   PyPI ka latest stable (2.1.0) purana tgcalls use karta hai jo Python 3.10+
+#   pe wheel nahi. GitHub main branch (2.3.3) ntgcalls use karta hai —
+#   Python 3.12 compatible (Heroku stack heroku-26).
+# ════════════════════════════════════════════════════════════════
+
+# Telegram MTProto — pyrofork installs as pyrogram namespace + has InputGroupCallSlug
+git+https://github.com/Mayuri-Chan/pyrofork.git
+TgCrypto
+
+# Voice/call support — GitHub main branch (ntgcalls backend, Python 3.12 compatible)
+git+https://github.com/pytgcalls/pytgcalls.git
+
+# Async HTTP
+aiohttp
+
+# Async SQLite
+aiosqlite
+
+# YouTube downloading
+yt-dlp
+
+# FFmpeg Python fallback (non-Heroku hosts ke liye)
+static-ffmpeg
+
+# System stats (/alive, /stats commands)
+psutil
+
+# Image card generation (/thumbnail, NP card)
+Pillow
+
+# Optional AI / metadata features (absent hone par gracefully disable)
+google-generativeai
+spotipy

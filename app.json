@@ -1,0 +1,119 @@
+{
+  "name": "4st Music Bot",
+  "description": "Fast Telegram music bot with YouTube streaming and group management.",
+  "keywords": [
+    "telegram",
+    "bot",
+    "music",
+    "python",
+    "youtube"
+  ],
+  "website": "https://t.me/ApexAssociation",
+  "stack": "heroku-26",
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "Standard-2X"
+    }
+  },
+  "env": {
+    "API_ID": {
+      "description": "Telegram App ID — my.telegram.org → API Development Tools",
+      "required": true,
+      "value": ""
+    },
+    "API_HASH": {
+      "description": "Telegram App Hash — my.telegram.org → API Development Tools",
+      "required": true,
+      "value": ""
+    },
+    "BOT_TOKEN": {
+      "description": "Bot Token — @BotFather on Telegram",
+      "required": true,
+      "value": ""
+    },
+    "SESSION_STRING": {
+      "description": "Pyrogram session string for the assistant/userbot account. Generate via SESSION_STRING_HELPER.py or @StringFatherBot.",
+      "required": false,
+      "value": ""
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram numeric user ID — message @userinfobot",
+      "required": true,
+      "value": ""
+    },
+    "OWNER_USERNAME": {
+      "description": "Your Telegram username without @",
+      "required": false,
+      "value": ""
+    },
+    "LOG_CHANNEL": {
+      "description": "Log channel ID (e.g. -1001234567890). Add bot as admin with post rights.",
+      "required": false,
+      "value": ""
+    },
+    "MUST_JOIN": {
+      "description": "Channel username (no @) users must join to use the bot. Leave empty to disable.",
+      "required": false,
+      "value": ""
+    },
+    "SUPPORT_CHAT": {
+      "description": "Support group invite link shown in /start",
+      "value": "",
+      "required": false
+    },
+    "GITHUB_TOKEN": {
+      "description": "GitHub personal access token with repo write scope — for data persistence across restarts.",
+      "required": false,
+      "value": ""
+    },
+    "BOT_REPO": {
+      "description": "GitHub repo for data sync, e.g. thomasir/4st_music.",
+      "value": "thomas91929/Musicbot",
+      "required": false
+    },
+    "YOUTUBE_COOKIES": {
+      "description": "YouTube cookies in Netscape format (base64-encoded).",
+      "required": false,
+      "value": "IyBOZXRzY2FwZSBIVFRQIENvb2tpZSBGaWxlCiMgaHR0cHM6Ly9jdXJsLmhheHguc2UvcmZjL2Nvb2tpZV9zcGVjLmh0bWwKIyBUaGlzIGlzIGEgZ2VuZXJhdGVkIGZpbGUhIERvIG5vdCBlZGl0LgoKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDA3MDkxNzQJX19TZWN1cmUtWU5JRAkyMC5ZVD1jYXZpWTg1d1p3M1Y4RU0zTFpBbjlRN0dEOUF4dGJEMUFVVTlyUE5NY2hzRlVBMEY0YWpSLU9KMEd0WUdoSzdJOVhMZkZLbkVfNHRIOHU0MTNUWGZMdzE3Z29YUkZwUExXY2xvck5tcVlNWWozeEtJZDR5N0d6UFF1OTlaVE1OYTR1M3MwZklENkZWQjEwRHRsc1RWb2RVcDF2bFRvMk1LdHZVV0hXc1ZKSHZ1X0dBTm56NnZVZ0dGS1hndE5RMmF3Q0pnNnpBbWdkRWsyTV9JZnU2R21MaDRGNHF3R24tQ0ZmN0Z4YS01M3cxa0hLUmdWa3c0WUN3X0Q4Zi1VcFl0aWo2Y3VlcUJyci1TbDI4amRRWDBoVmhLZmYxbEV2YnBfTl93SnVwNy1HX0xKdjNZUjlwdmNGSF9oUjFxeENkaHd5Z0VjS1FHTFVxb0RKb2VrYmUyX3cKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE3ODQ3MzI0ODgJR1BTCTEKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MDA3MDkxOTIJVklTSVRPUl9JTkZPMV9MSVZFCVNOX0ZxcGd5a19rCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODAwNzA5MTkyCVZJU0lUT1JfUFJJVkFDWV9NRVRBREFUQQlDZ0pKVGhJRUdnQWdXQSUzRCUzRAoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgxOTcxNzE5MglQUkVGCWY0PTQwMDAwMDAmdHo9QXNpYS5Lb2xrYXRhJmY2PTQwMDAwMDAwJmdsPUlOCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2MzU0MjMzCV9fU2VjdXJlLTFQU0lEVFMJc2lkdHMtQ2pRQlBXRXUyZER4Q01DR0x6WjAzNEJtMDhHeW9ienc5Nmdzc1R0cG5jZm9YOUFNdF9nRmFsOUppNXlHNXZCVzVhOTZ2QnpZRUFBCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2MzU0MjMzCV9fU2VjdXJlLTNQU0lEVFMJc2lkdHMtQ2pRQlBXRXUyZER4Q01DR0x6WjAzNEJtMDhHeW9ienc5Nmdzc1R0cG5jZm9YOUFNdF9nRmFsOUppNXlHNXZCVzVhOTZ2QnpZRUFBCi55b3V0dWJlLmNvbQlUUlVFCS8JRkFMU0UJMTgxOTI5MDcyNwlIU0lECUFsYkdyeFBkc1kzeFhRSms2Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5MjkwNzI3CVNTSUQJQU1weHJ4cEFQRHl2LXJaQUkKLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxODE5MjkwNzI3CUFQSVNJRAlZT1o1NDhGbnRmcG1meTBkL0FudDZsWDVaUVBSOEV4c094Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5MjkwNzI3CVNBUElTSUQJQVNYMWREUlJCX2ZiNGx3ZC9BRVhEWUtWcHZpT2taMTJ5VgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgxOTI5MDcyNwlfX1NlY3VyZS0xUEFQSVNJRAlBU1gxZERSUkJfZmI0bHdkL0FFWERZS1ZwdmlPa1oxMnlWCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5MjkwNzI3CV9fU2VjdXJlLTNQQVBJU0lECUFTWDFkRFJSQl9mYjRsd2QvQUVYRFlLVnB2aU9rWjEyeVYKLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxODE5MjkwNzI3CVNJRAlnLmEwMDBBZ2xyVVhsSlRZWkM2YkFZTEx3alpCMFNtZF9YQzFySVJzTFFzMEkyY0lfZGppVWtUczlvRFc5VXh5Y2k0VERVYW53WVdBQUNnWUtBUVVTQVJjU0ZRSEdYMk1pZ2RUQW14b0F2Ql9JUVpRakRnQUVyeG9WQVVGOHlLcE9fNnc3ckRmVFI4cnoxVk4xQi1oazAwNzYKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTkyOTA3MjcJX19TZWN1cmUtMVBTSUQJZy5hMDAwQWdsclVYbEpUWVpDNmJBWUxMd2paQjBTbWRfWEMxcklSc0xRczBJMmNJX2RqaVVrY3pNRkRzeVV0V2RkZTBTaGJlVE9FZ0FDZ1lLQWY0U0FSY1NGUUhHWDJNaVBiQUFxRnVjNEJJVzlNbzdZcXM5UnhvVkFVRjh5S3FETzBVWmplc3I1OUgwNmtjTVhpY0IwMDc2Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE5MjkwNzI3CV9fU2VjdXJlLTNQU0lECWcuYTAwMEFnbHJVWGxKVFlaQzZiQVlMTHdqWkIwU21kX1hDMXJJUnNMUXMwSTJjSV9kamlVa0xkUHdTbkxsLXpUYi1ETURnczZpLWdBQ2dZS0FSUVNBUmNTRlFIR1gyTWlqTE0yRkVpMS1QNHBqNFg4WTJ1Y0lCb1ZBVUY4eUtxNE14cmVXZ0xQY1BwZDRMVGE2OHBsMDA3NgoueW91dHViZS5jb20JVFJVRQkvCVRSVUUJMTgxOTI5MDcyNwlMT0dJTl9JTkZPCUFGbW1GMnN3UlFJaEFKU1VZYzNZQWhFUGRaUFdmZnB6WW1fb1VTQ1g1NlRsQzNkeDRGLXRCRWVBQWlCbmJuQlN3MDZtMno3c040c1VsQmliYnA1M1pOWTNBUTg1bG9HZF9FdnE3dzpRVVEzTWpObWVWUTRORU00UjJ4aGNWWnRZbE4yYlY5aE0wZEZMVjl0WldoWGRFdFpOblJzYVhCclpEUnJPR05qVW1weGJWaHRVMlZhTURkQlpUTm9aSGxGWW5OeWRGaFpTRlJEUldwSWVYbDJZV0poVmt4R1JXRTBUMlpZTlRKZllqSXdjSFJ2WlhrMmJtSjBNRnBMVmkweWNuVlBlVjk2TUVadVRHODRjbU16Wkhjd1J6QnZjaTFvTm1WRU16WnNSSGg0T1c5dlExZzJUa3N6TjNGVVNFeG4KLnlvdXR1YmUuY29tCVRSVUUJLwlGQUxTRQkxODE2NjkzMTkzCVNJRENDCUFLRXlYelhZR2ZEeXk0V0FEZUk5RUVUQTFIR1FSR2RLQnpkS2tBdGZaTEdHakUzdDlwemZfMjZQay1PQ0ZIaHVTTk1JMEpLMmN3Ci55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODE2NjkzMTkzCV9fU2VjdXJlLTFQU0lEQ0MJQUtFeVh6VkljZko4UkhuNXExTzJxb0FnQ09tUGFDcnhoVTBjRUtwU3E2NEhLa3o2WUZVcjEwbXRSRVI3angzSmJTUTdVdE1CMEEKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTE4MTY2OTMxOTMJX19TZWN1cmUtM1BTSURDQwlBS0V5WHpXNG52V05WYkswZC1tU19aT0FFSE9OUnVBMEcxa1pSdWpjT29lcjdNeHRIWjl0TF9PUXVmeGFPNFZCbUhEZzFYbmZ5VDgKLnlvdXR1YmUuY29tCVRSVUUJLwlUUlVFCTAJWVNDCUNhelE1R3pTS0hZCi55b3V0dWJlLmNvbQlUUlVFCS8JVFJVRQkxODAwNzA5MTc0CV9fU2VjdXJlLVJPTExPVVRfVE9LRU4JQ0tUQTJiR2p2N0gxa0FFUTFwbXk5Yl9tbFFNWXY1Q28ydlR5bFFNJTNE"
+    },
+    "VOLUME_BOOST": {
+      "description": "Default volume multiplier (0.01–2.0). Default 1.5 = 150%.",
+      "value": "1.5",
+      "required": false
+    },
+    "MUSIC_ARCHIVE_CHANNEL": {
+      "description": "Telegram channel ID for media cache. Add bot as admin with post rights.",
+      "required": false,
+      "value": ""
+    },
+    "MAX_QUEUE_SIZE": {
+      "description": "Maximum songs a group can queue at once.",
+      "value": "50",
+      "required": false
+    },
+    "GEMINI_API_KEY": {
+      "description": "Google Gemini API key for AI chatbot. Get at: aistudio.google.com/apikey",
+      "required": false,
+      "value": ""
+    },
+    "SPOTIFY_CLIENT_ID": {
+      "description": "Spotify Client ID for Spotify support. Get at: developer.spotify.com/dashboard",
+      "required": false,
+      "value": ""
+    },
+    "SPOTIFY_CLIENT_SECRET": {
+      "description": "Spotify Client Secret.",
+      "required": false,
+      "value": ""
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
