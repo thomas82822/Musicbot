@@ -435,10 +435,6 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
     try:
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
 
-        # SILENCE RACE FIX — clear the silence flag so that when the real song's
-        # stream eventually ends, on_stream_end will call _play_next normally.
-        _silence_playing.pop(chat_id, None)
-
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
 
@@ -461,6 +457,21 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
             )
 
         await _try_play_or_change(chat_id, stream, prefer_change=already_in_vc)
+
+        # ── SILENCE RACE FIX (corrected placement) ──────────────────────────
+        # The silence MP3 is consumed by ntgcalls faster than real-time
+        # (~1.2 s for a 4-s file).  Its stream_end event is queued in the
+        # asyncio event loop while we are still inside `await change_stream()`.
+        # If we clear _silence_playing BEFORE that await, on_stream_end runs
+        # during the await, sees the flag as False, and calls _play_next() →
+        # empty queue → "Queue Finished" after just one second.
+        #
+        # Clearing AFTER change_stream returns means the flag stays True for
+        # the entire duration of the await.  Any queued silence stream_end that
+        # runs while we are inside change_stream() will still see True and be
+        # correctly ignored.  Only stream_end events fired after this line
+        # belong to the real song.
+        _silence_playing.pop(chat_id, None)
 
     except Exception as e:
         log.error("_stream_song error in %s: %s", chat_id, e)
@@ -512,6 +523,11 @@ async def _stream_song_video_with_fallback(
             )
             song.is_video = False
             await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
+
+        # SILENCE RACE FIX — same as _stream_song: clear AFTER play/change_stream
+        # completes so that any queued silence stream_end (fired while we were
+        # inside the await) still sees the flag as True and is ignored.
+        _silence_playing.pop(chat_id, None)
 
     except Exception as e:
         log.error("_stream_song_video_with_fallback error in %s: %s", chat_id, e)
