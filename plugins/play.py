@@ -448,12 +448,22 @@ async def _play_next_inner(chat_id: int):
         # pipe failure, mark the URL so _resolve_stream takes the local-download
         # path (which uses curl_cffi / Chrome TLS fingerprint and bypasses the
         # CDN block), then re-resolve and replay the same track.
+        #
+        # BUG FIX: On cloud hosts (_ON_CLOUD_HOST=True) pipes are NEVER used —
+        # _resolve_stream skips directly to local download on every call.
+        # The elapsed<30s condition fires for any play failure (e.g. a vplay
+        # video attempt that timed out), not just pipe failures.  Running the
+        # retry on cloud causes the same track to be downloaded a second time
+        # and then _stream_song is called mid-playback, causing a conflict and
+        # freeze.  Guard: skip retry when cdn is already blocked (cloud host).
+        from helpers.youtube import is_cdn_blocked as _is_cdn_blocked_retry
         if (
             not next_song
             and prev
             and not _loop.get(chat_id, False)
             and elapsed < 30
             and (prev.webpage_url or "")
+            and not _is_cdn_blocked_retry()   # cloud hosts never use pipes
         ):
             retry_url = prev.webpage_url
             try:
@@ -587,11 +597,39 @@ async def _stream_song_video_with_fallback(
 
     try:
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
+        from helpers.youtube import is_cdn_blocked as _is_cdn_blocked
 
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
 
         reconnect = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+
+        # BUG FIX: Cloud hosts (Heroku/Railway/Render) cannot download YouTube
+        # DASH video+audio streams — the CDN blocks fragment fetches, so
+        # _download_audio_sync ends up with an audio-only file regardless of
+        # the requested format.  Passing that audio-only file with VideoQuality
+        # set causes NTgCalls to hang (no video frames) → 15 s timeout fires →
+        # TimeoutError propagates → _silence_playing never cleared → bot freezes
+        # muted in VC for the rest of the session.
+        #
+        # Fix: detect cloud hosts via is_cdn_blocked() and skip the video
+        # stream attempt entirely.  Stream audio directly — /vplay still works,
+        # it just plays audio (same experience for voice chats without a video
+        # surface anyway).
+        if _is_cdn_blocked():
+            log.info(
+                "☁️ Cloud host — vplay falling back to audio mode (CDN blocks video DASH) | %d",
+                chat_id,
+            )
+            audio_stream = MediaStream(
+                song.url,
+                audio_parameters  = AudioQuality.STUDIO,
+                ffmpeg_parameters = reconnect,
+                headers           = song.http_headers,
+            )
+            song.is_video = False
+            await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
+            return
 
         video_stream = MediaStream(
             song.url,
@@ -618,13 +656,16 @@ async def _stream_song_video_with_fallback(
             song.is_video = False
             await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
 
-        # SILENCE RACE FIX — same as _stream_song: clear AFTER play/change_stream
-        # completes so that any queued silence stream_end (fired while we were
-        # inside the await) still sees the flag as True and is ignored.
-        _silence_playing.pop(chat_id, None)
-
     except Exception as e:
         log.error("_stream_song_video_with_fallback error in %s: %s", chat_id, e)
+    finally:
+        # SILENCE RACE FIX — moved to finally so _silence_playing is ALWAYS
+        # cleared even when an exception or TimeoutError propagates.
+        # Previously this was inside the try block — any exception in
+        # _try_play_or_change (including CancelledError from wait_for) skipped
+        # this line, leaving _silence_playing[chat_id]=True forever and causing
+        # all future stream_end events to be silently dropped → bot frozen muted.
+        _silence_playing.pop(chat_id, None)
 
 
 async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False):
