@@ -483,31 +483,33 @@ async def _play_next_inner(chat_id: int):
             next_song = pop_queue(chat_id)
 
         # ── PIPE-FAILURE RETRY ──────────────────────────────────────────────
-        # On Heroku (cdn_blocked), yt-dlp's FIFO subprocess can only download
-        # the first DASH segment (~1 MB) before the CDN blocks subsequent
-        # segments.  The stream ends after ~11 s → stream_end fires → we land
+        # On Heroku/Railway/Render (cdn_blocked), _resolve_stream uses a FIFO
+        # pipe for the FIRST attempt of each URL (when _pipe_failures[url]==0).
+        # The yt-dlp subprocess can only download the first DASH segment
+        # (~1-2 MB, ~10-25 s of audio) before the CDN blocks subsequent
+        # segments.  The broken-pipe error fires → stream_end fires → we land
         # here with an empty queue and a song that barely started.
         #
-        # Fix: detect "song played < 30 s AND queue empty AND no loop" as a
-        # pipe failure, mark the URL so _resolve_stream takes the local-download
+        # Fix: detect "song played < 30 s AND queue empty AND no loop" AND
+        # "a pipe actually failed for this URL" (had_pipe_failure) as a pipe
+        # failure, mark the URL so _resolve_stream takes the local-download
         # path (which uses curl_cffi / Chrome TLS fingerprint and bypasses the
         # CDN block), then re-resolve and replay the same track.
         #
-        # BUG FIX: On cloud hosts (_ON_CLOUD_HOST=True) pipes are NEVER used —
-        # _resolve_stream skips directly to local download on every call.
-        # The elapsed<30s condition fires for any play failure (e.g. a vplay
-        # video attempt that timed out), not just pipe failures.  Running the
-        # retry on cloud causes the same track to be downloaded a second time
-        # and then _stream_song is called mid-playback, causing a conflict and
-        # freeze.  Guard: skip retry when cdn is already blocked (cloud host).
-        from helpers.youtube import is_cdn_blocked as _is_cdn_blocked_retry
+        # NOTE: The old guard `not is_cdn_blocked()` was WRONG — cloud hosts
+        # DO use pipes for the first attempt (when _pipe_failures[url]==0).
+        # Blocking the retry on cloud hosts caused "Queue Finished" immediately
+        # after searching, because the pipe failed but the retry was suppressed.
+        # The correct guard is had_pipe_failure(url): only retry when the pipe
+        # specifically failed for this URL, regardless of host type.
+        from helpers.youtube import is_cdn_blocked as _is_cdn_blocked_retry, had_pipe_failure as _had_pipe_failure
         if (
             not next_song
             and prev
             and not _loop.get(chat_id, False)
             and elapsed < 30
             and (prev.webpage_url or "")
-            and not _is_cdn_blocked_retry()   # cloud hosts never use pipes
+            and (not _is_cdn_blocked_retry() or _had_pipe_failure(prev.webpage_url or ""))
         ):
             retry_url = prev.webpage_url
             try:

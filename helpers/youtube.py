@@ -117,6 +117,21 @@ def mark_pipe_failed(url: str) -> None:
         _pipe_failures[url] = max(1, _pipe_failures.get(url, 0) + 1)
     log.debug("📌 Pipe marked failed — will retry via local-dl | %s", url[:80])
 
+
+def had_pipe_failure(url: str) -> bool:
+    """
+    Return True if this URL has had at least one FIFO pipe failure.
+
+    Used by play.py's pipe-failure retry logic to distinguish between:
+      a) Song ended naturally (no pipe failure → don't retry)
+      b) Pipe failed mid-stream (pipe failure recorded → retry via local-dl)
+
+    This lets the retry fire on cloud hosts (where is_cdn_blocked() is True)
+    when a pipe was used for the first attempt and then failed — which is the
+    exact scenario that caused "Queue Finished" immediately after searching.
+    """
+    return _pipe_failures.get(url, 0) >= 1
+
 # ── Cache ─────────────────────────────────────────────────────────
 # tuple: (media_url, audio_url, duration, http_headers, expires_at)
 _stream_cache: dict[tuple[str, bool], tuple[str, str | None, int, dict, float]] = {}
