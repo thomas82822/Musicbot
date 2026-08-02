@@ -1284,7 +1284,23 @@ def _start_pipe_download(url: str, audio_only: bool) -> str:
         + '    "socket_timeout": 8,\n'
         + '    "retries": 3,\n'
         + '    "fragment_retries": 3,\n'
-        + '    "concurrent_fragment_downloads": 16,\n'
+        # ROOT-CAUSE FIX — concurrent_fragment_downloads must be 1 for FIFO pipe.
+        #
+        # With concurrent_fragment_downloads=N, yt-dlp downloads N fragments
+        # simultaneously and then writes them to stdout as one burst (N × ~80 KB
+        # ≈ N × 5 s of Opus audio).  After writing the batch it pauses while
+        # downloading the NEXT N fragments.  During that pause, proc.stdout.read()
+        # blocks → no new bytes reach the FIFO → NTgCalls' internal ffmpeg waits
+        # → ffmpeg read-timeout fires → ffmpeg closes the FIFO read-end →
+        # the next write from this thread raises [Errno 32] Broken pipe.
+        #
+        # With N=1 (sequential), each fragment is downloaded and written to
+        # stdout immediately as it completes.  The data flows continuously with
+        # only millisecond gaps between fragments — well within ffmpeg's read
+        # buffer — so the pipe never starves and Broken pipe never occurs.
+        # Sequential is actually FASTER for streaming: the first fragment is
+        # available after ~0.1 s instead of waiting for all 16 to finish.
+        + '    "concurrent_fragment_downloads": 1,\n'
         + f'    "js_runtimes": {{"deno": {{"path": {repr(deno)}}}}},\n'
         + '    "remote_components": ["ejs:github"],\n'
         + f'    "extractor_args": {_extractor_args_repr},\n'
