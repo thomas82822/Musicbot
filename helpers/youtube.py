@@ -1079,10 +1079,20 @@ def _download_audio_sync(url: str, audio_only: bool) -> tuple[str, int]:
     generic OpenSSL TLS stack (ntgcalls/ffmpeg) but allows Chrome-fingerprint
     downloads even from Heroku/cloud IPs. Reading from a local file bypasses
     all streaming CDN restrictions entirely.
+
+    BUG FIX: Previously used a single "bestaudio/best" format with ["default"]
+    client — on Heroku/cloud IPs this triggers YouTube's sign-in wall and
+    returns "Requested format is not available".  Fixed: try multiple
+    format+client combos in priority order (same strategy as _extract_sync),
+    with "web" client + cookies first since it authenticates best via browser
+    session cookies.
     """
     cookie = _resolve_cookie_file()
-    tmpdir = tempfile.mkdtemp(prefix="apex_dl_")
-    fmt = (
+
+    # Format + client combos tried in priority order.
+    # Cookie-first: "web" client authenticates fully with browser cookies and
+    # unlocks formats that the generic "default" client cannot access on cloud IPs.
+    _VIDEO_FMT = (
         # BUG FIX: Was 1080p → 1.7 GB+ for a 2-hour movie before playback even
         # started.  Capped to 720p: still excellent quality in a Telegram Voice
         # Chat but ~60 % smaller.  This is the FALLBACK path (pipe failed); the
@@ -1090,67 +1100,117 @@ def _download_audio_sync(url: str, audio_only: bool) -> tuple[str, int]:
         "bestvideo[height<=720][vcodec!=none]+bestaudio"
         "/best[height<=720][vcodec!=none][acodec!=none]"
         "/best[height<=720]/best"
-        if not audio_only
-        else "bestaudio/best"
     )
-    opts: dict = {
-        "format": fmt,
-        "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        # ⚡ SPEED FIX: 16 parallel fragment threads — ultra-fast DASH/HLS downloads
-        "concurrent_fragment_downloads": 16,
-        # ⚡ SPEED FIX: larger read buffer for high-speed downloads
-        # NOTE: yt-dlp expects bytes as int — string like "32M" causes
-        # "'<' not supported between instances of 'str' and 'int'" error.
-        "buffersize": 32 * 1024 * 1024,
-        # ⚡ SPEED FIX: skip slow format pre-verification
-        "check_formats": False,
-        # ⚡ SPEED FIX: more retries = fewer full restarts
-        "retries": 5,
-        "fragment_retries": 5,
-    }
-    if cookie:
-        opts["cookiefile"] = cookie
+    if audio_only:
+        combos: list[tuple[str, list]] = (
+            [
+                ("bestaudio[ext=m4a]/bestaudio/best", ["web"]),
+                ("bestaudio/best",                    ["web", "default"]),
+                ("bestaudio/best",                    ["default"]),
+            ] if cookie else [
+                ("bestaudio/best", ["default"]),
+                ("bestaudio/best", ["web_embedded"]),
+            ]
+        )
+    else:
+        combos = (
+            [
+                (_VIDEO_FMT, ["web"]),
+                (_VIDEO_FMT, ["web", "default"]),
+                (_VIDEO_FMT, ["default"]),
+            ] if cookie else [
+                (_VIDEO_FMT, ["default"]),
+            ]
+        )
 
-    # Carry over bgutil/PO-token extractor args and custom headers
-    base = _opts(audio_only)
-    for k in ("extractor_args", "http_headers"):
-        if k in base:
-            opts[k] = base[k]
+    _RETRYABLE = (
+        "Requested format is not available",
+        "format is not available",
+        "No video formats found",
+        "Sign in to confirm",
+        "This video is not available",
+        "HTTP Error 403",
+        "HTTP Error 429",
+        "requires payment",
+        "members-only",
+    )
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return "", 0
+    for fmt, clients in combos:
+        tmpdir = tempfile.mkdtemp(prefix="apex_dl_")
+        opts: dict = {
+            "format": fmt,
+            "outtmpl": os.path.join(tmpdir, "audio.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            # ⚡ SPEED FIX: 16 parallel fragment threads — ultra-fast DASH/HLS downloads
+            "concurrent_fragment_downloads": 16,
+            # ⚡ SPEED FIX: larger read buffer for high-speed downloads
+            # NOTE: yt-dlp expects bytes as int — string like "32M" causes
+            # "'<' not supported between instances of 'str' and 'int'" error.
+            "buffersize": 32 * 1024 * 1024,
+            # ⚡ SPEED FIX: skip slow format pre-verification
+            "check_formats": False,
+            # ⚡ SPEED FIX: more retries = fewer full restarts
+            "retries": 5,
+            "fragment_retries": 5,
+        }
+        if cookie:
+            opts["cookiefile"] = cookie
 
-            ext = info.get("ext", "opus")
-            path = os.path.join(tmpdir, f"audio.{ext}")
-            if not os.path.exists(path):
-                files = [
-                    f for f in os.listdir(tmpdir)
-                    if os.path.isfile(os.path.join(tmpdir, f))
-                ]
-                if not files:
+        # Carry over bgutil/PO-token extractor args, headers, and other
+        # settings from _opts() so the correct player client is used.
+        base = _opts(audio_only, player_client=clients)
+        for k in ("extractor_args", "http_headers", "js_runtimes",
+                  "remote_components", "geo_bypass", "geo_bypass_country",
+                  "socket_timeout", "noplaylist"):
+            if k in base:
+                opts[k] = base[k]
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
                     shutil.rmtree(tmpdir, ignore_errors=True)
-                    return "", 0
-                path = os.path.join(tmpdir, files[0])
+                    continue
 
-            dur = info.get("duration", 0) or 0
-            size_mb = os.path.getsize(path) / 1e6
-            log.info(
-                "✅ yt-dlp download OK | %s → %s (%.1f MB, %ds)",
-                url[:60], os.path.basename(path), size_mb, dur,
-            )
+                ext = info.get("ext", "opus")
+                path = os.path.join(tmpdir, f"audio.{ext}")
+                if not os.path.exists(path):
+                    files = [
+                        f for f in os.listdir(tmpdir)
+                        if os.path.isfile(os.path.join(tmpdir, f))
+                    ]
+                    if not files:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+                        continue
+                    path = os.path.join(tmpdir, files[0])
 
-            return path, dur
-    except Exception as e:
-        log.error("❌ yt-dlp local download failed: %s", e)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return "", 0
+                dur = info.get("duration", 0) or 0
+                size_mb = os.path.getsize(path) / 1e6
+                log.info(
+                    "✅ yt-dlp download OK | fmt=%r clients=%s | %s → %s (%.1f MB, %ds)",
+                    fmt, clients, url[:60], os.path.basename(path), size_mb, dur,
+                )
+                return path, dur
+        except yt_dlp.utils.DownloadError as e:
+            err = str(e)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if any(r in err for r in _RETRYABLE):
+                log.warning(
+                    "⚠️ Download retry | fmt=%r clients=%s — %s",
+                    fmt, clients, err[:100],
+                )
+                continue
+            log.error("❌ yt-dlp local download fatal: %s", e)
+            return "", 0
+        except Exception as e:
+            log.error("❌ yt-dlp local download failed: %s", e)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return "", 0
+
+    log.error("❌ yt-dlp local download: all format combos exhausted for %s", url[:60])
+    return "", 0
 
 
 def cleanup_temp_file(path: str) -> None:
