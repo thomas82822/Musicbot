@@ -1350,31 +1350,71 @@ def _start_pipe_download(url: str, audio_only: bool) -> str:
             #   pytgcalls ffmpeg auto-detects webm from the 4-byte EBML magic header
             #   (no seeking needed). Music plays at exact correct speed from byte 0.
 
-            # Poll for a FIFO reader with bounded timeout
-            deadline = time.monotonic() + _PIPE_CONNECT_TIMEOUT
-            while time.monotonic() < deadline:
+            # ROOT-CAUSE FIX — Replace O_NONBLOCK polling with a blocking open.
+            #
+            # Old approach (O_NONBLOCK polling, 100 ms interval):
+            #   The writer polls os.open(O_NONBLOCK) every 100 ms. When ntgcalls
+            #   opens the FIFO read-end, there is a window of up to 100 ms where
+            #   the read-end IS open but the write-end is NOT. During that window,
+            #   ntgcalls reads from the FIFO and immediately gets EOF (POSIX:
+            #   read() returns 0 when no writer has the write-end open). ntgcalls
+            #   closes the read-end. When the writer's next poll succeeds and it
+            #   starts writing, there is no longer a reader → [Errno 32] Broken pipe.
+            #
+            # New approach (blocking open in a daemon sub-thread):
+            #   os.open(O_WRONLY) without O_NONBLOCK blocks until a reader opens
+            #   the read-end. The write-end therefore opens ATOMICALLY with the
+            #   read-end — there is zero window where the read-end is open without
+            #   a writer → ntgcalls never sees a spurious EOF → no broken pipe.
+            #   A daemon sub-thread is used so we can enforce the connect timeout
+            #   and check cancellation without blocking the outer writer thread.
+            _open_evt = threading.Event()
+            _open_result: list = [None]
+
+            def _blocking_open() -> None:
+                try:
+                    _open_result[0] = os.open(pipe_path, os.O_WRONLY)
+                except Exception as _be:
+                    _open_result[0] = _be
+                finally:
+                    _open_evt.set()
+
+            _opener_t = threading.Thread(target=_blocking_open, daemon=True,
+                                         name="apex-fifo-opener")
+            _opener_t.start()
+
+            _conn_deadline = time.monotonic() + _PIPE_CONNECT_TIMEOUT
+            while not _open_evt.wait(timeout=0.3):
+                if time.monotonic() >= _conn_deadline:
+                    log.warning(
+                        "FIFO reader did not connect in %.1fs | %s",
+                        _PIPE_CONNECT_TIMEOUT,
+                        url[:60],
+                    )
+                    # Unblock _blocking_open by briefly opening a dummy reader.
+                    try:
+                        _dummy = os.open(pipe_path, os.O_RDONLY | os.O_NONBLOCK)
+                        os.close(_dummy)
+                    except Exception:
+                        pass
+                    return
                 with _pipe_states_lock:
                     state = _pipe_states.get(pipe_path)
-                    cancelled = state is None or state["cancelled"]
-                if cancelled:
+                    _cancelled = state is None or state["cancelled"]
+                if _cancelled:
+                    try:
+                        _dummy = os.open(pipe_path, os.O_RDONLY | os.O_NONBLOCK)
+                        os.close(_dummy)
+                    except Exception:
+                        pass
                     return
-                try:
-                    fifo_fd = os.open(pipe_path, os.O_WRONLY | os.O_NONBLOCK)
-                    # Switch to blocking mode after reader connects
-                    flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
-                    fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-                    break
-                except OSError as exc:
-                    if exc.errno != errno.ENXIO:
-                        raise
-                    time.sleep(0.1)
-            else:
-                log.warning(
-                    "FIFO reader did not connect in %.1fs | %s",
-                    _PIPE_CONNECT_TIMEOUT,
-                    url[:60],
-                )
-                return
+
+            if isinstance(_open_result[0], Exception):
+                raise _open_result[0]
+            fifo_fd = _open_result[0]
+            # Ensure blocking mode (O_WRONLY is blocking by default, but confirm).
+            flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
+            fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
             # ⚡ SPEED FIX v5 — Dual fix for "fast speed at start" bug.
             #
