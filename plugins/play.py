@@ -791,12 +791,30 @@ async def _retry_premature_stream(chat_id: int, song: Song) -> bool:
     The stale `song.url` from the failed attempt is a one-shot FIFO path
     that has already been torn down (see helpers/youtube._start_pipe_download's
     cleanup in its `finally` block) — reusing it would just fail again.
+
+    On cloud hosts (Heroku) where the YouTube CDN is IP-blocked, the FIFO pipe
+    always fails after the first DASH segment (~1-2 MB).  The background writer
+    thread that records the failure in _pipe_failures runs concurrently and may
+    not have updated the counter by the time this retry fires (race condition).
+    We therefore call mark_pipe_failed() explicitly here so that the subsequent
+    get_stream() call sees _pipe_failures > 0 and goes straight to the
+    local-download path (_download_audio_sync / curl_cffi) instead of starting
+    yet another doomed FIFO pipe.
+
     Returns True if a retry attempt was launched, False if re-resolution
     failed (caller should then fall back to advancing the queue normally).
     """
-    from helpers.youtube import get_stream
+    from helpers.youtube import get_stream, mark_pipe_failed
 
     target_url = song.webpage_url or song.url
+
+    # Force the next get_stream() call to skip the pipe and use local download.
+    # This is safe even if the pipe hadn't formally failed yet — the stream_end
+    # firing in < _PREMATURE_END_THRESHOLD seconds is proof enough the pipe
+    # can't deliver audio on this host.
+    mark_pipe_failed(target_url)
+    log.info("📥 Premature-end retry: pipe marked failed → will use local download | %s", target_url[:80])
+
     try:
         stream_url, _audio_url, dur, http_headers = await get_stream(
             target_url, is_video=song.is_video
