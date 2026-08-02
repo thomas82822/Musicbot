@@ -384,11 +384,52 @@ async def _fetch_autoplay_song(chat_id: int, prev: Song | None) -> Song | None:
 async def _play_next(chat_id: int):
     try:
         prev = get_current(chat_id)
+        elapsed = time.time() - _start_time.get(chat_id, 0.0)
 
         if _loop.get(chat_id) and prev:
             next_song = prev
         else:
             next_song = pop_queue(chat_id)
+
+        # ── PIPE-FAILURE RETRY ──────────────────────────────────────────────
+        # On Heroku (cdn_blocked), yt-dlp's FIFO subprocess can only download
+        # the first DASH segment (~1 MB) before the CDN blocks subsequent
+        # segments.  The stream ends after ~11 s → stream_end fires → we land
+        # here with an empty queue and a song that barely started.
+        #
+        # Fix: detect "song played < 30 s AND queue empty AND no loop" as a
+        # pipe failure, mark the URL so _resolve_stream takes the local-download
+        # path (which uses curl_cffi / Chrome TLS fingerprint and bypasses the
+        # CDN block), then re-resolve and replay the same track.
+        if (
+            not next_song
+            and prev
+            and not _loop.get(chat_id, False)
+            and elapsed < 30
+            and (prev.webpage_url or "")
+        ):
+            retry_url = prev.webpage_url
+            try:
+                import dataclasses as _dc
+                from helpers.youtube import mark_pipe_failed, get_stream
+                mark_pipe_failed(retry_url)                  # force local-dl path
+                stream_url, _, dur, hdrs = await get_stream(
+                    retry_url, is_video=prev.is_video, force_refresh=True
+                )
+                if stream_url:
+                    next_song = _dc.replace(
+                        prev,
+                        url          = stream_url,
+                        duration     = dur or prev.duration,
+                        http_headers = hdrs or prev.http_headers,
+                    )
+                    log.info(
+                        "🔄 Pipe-fail retry via local-dl | %.1fs elapsed | %s",
+                        elapsed, (prev.title or "?")[:60],
+                    )
+            except Exception as _re:
+                log.warning("Pipe retry failed for %s: %s", prev.title, _re)
+        # ── END PIPE-FAILURE RETRY ──────────────────────────────────────────
 
         if not next_song and await _safe_get_autoplay(chat_id):
             next_song = await _fetch_autoplay_song(chat_id, prev)

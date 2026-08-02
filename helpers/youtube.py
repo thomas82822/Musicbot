@@ -101,6 +101,22 @@ def is_cdn_blocked() -> bool:
     """Return True when CDN streaming is known-blocked (cloud host or after a premature EOF)."""
     return _cdn_blocked
 
+
+def mark_pipe_failed(url: str) -> None:
+    """
+    Mark a URL as having failed FIFO pipe streaming so the next call to
+    get_stream() / _resolve_stream() for this URL takes the local-download
+    path instead of retrying the FIFO.
+
+    Called from play.py when stream_end fires after < 30 s of playback
+    (premature end caused by yt-dlp stalling on DASH segment 2+ over
+    Heroku's blocked CDN).  Pre-incrementing here ensures the retry
+    happens even if the writer-thread exception handler hasn't run yet.
+    """
+    with _pipe_states_lock:
+        _pipe_failures[url] = max(1, _pipe_failures.get(url, 0) + 1)
+    log.debug("📌 Pipe marked failed — will retry via local-dl | %s", url[:80])
+
 # ── Cache ─────────────────────────────────────────────────────────
 # tuple: (media_url, audio_url, duration, http_headers, expires_at)
 _stream_cache: dict[tuple[str, bool], tuple[str, str | None, int, dict, float]] = {}
