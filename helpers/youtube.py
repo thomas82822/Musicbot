@@ -1575,7 +1575,7 @@ def _start_pipe_download(url: str, audio_only: bool) -> str:
             # buffering=0: os.fdopen without it creates an 8 KB BufferedWriter
             # that stacks on the 4 KB kernel FIFO → 12 KB pre-fill. FileIO
             # makes every write() a direct syscall so pre-fill stays at 4 KB.
-            time.sleep(0.20)  # ← FIX: allow ntgcalls audio pipeline to init
+            time.sleep(0.25)  # ← FIX: allow ntgcalls audio pipeline to init (0.25s for robust init)
             _CHUNK_SIZE = 4096
             with os.fdopen(fifo_fd, "wb", buffering=0) as fifo_out:
                 fifo_fd = None

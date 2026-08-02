@@ -49,6 +49,7 @@ _extra_cache:     dict[int, str]           = {}   # cached "UP NEXT" / "AUTOPLAY
 _silence_playing: dict[int, bool]          = {}
 _play_next_locks:    dict[int, asyncio.Lock]  = {}
 _stream_changed_at:  dict[int, float]         = {}
+_active_join_tasks:  dict[int, asyncio.Task]  = {}   # per-chat early-join tasks; cancelled by /stop
 # ↑ MEMORY/R14 FIX: per-chat mutex + stream-transition cooldown for _play_next.
 #
 # Root cause A (fixed): NTgCalls fires 8-10 stream_end events in rapid
@@ -514,11 +515,17 @@ async def _play_next_inner(chat_id: int):
         # The correct guard is had_pipe_failure(url): only retry when the pipe
         # specifically failed for this URL, regardless of host type.
         from helpers.youtube import is_cdn_blocked as _is_cdn_blocked_retry, had_pipe_failure as _had_pipe_failure
+        # PIPE-FAILURE RETRY: Use a duration-aware window instead of a hard 30s cutoff.
+        # With a hard 30s limit, a pipe that breaks at 40s into a 5-minute song
+        # was skipping the retry → premature "Queue Finished". Now we retry as
+        # long as the song hasn't played through at least 85% of its known duration.
+        _song_dur = prev.duration if prev else 0
+        _retry_window = max(30, int(_song_dur * 0.85)) if (_song_dur and _song_dur > 30) else 30
         if (
             not next_song
             and prev
             and not _loop.get(chat_id, False)
-            and elapsed < 30
+            and elapsed < _retry_window
             and (prev.webpage_url or "")
             and (not _is_cdn_blocked_retry() or _had_pipe_failure(prev.webpage_url or ""))
         ):
@@ -559,9 +566,22 @@ async def _play_next_inner(chat_id: int):
             _stream_changed_at.pop(chat_id, None)
             _paused.pop(chat_id, None)
             _extra_cache.pop(chat_id, None)
+            _stream_retries.pop(chat_id, None)
+            # QUEUE FINISHED DRAIN FIX: stream_end fires when yt-dlp closes the
+            # FIFO (all bytes written), but NTgCalls' internal ffmpeg decoder may
+            # still have decoded audio frames queued. A short sleep lets those
+            # frames play out before we cut the VC connection, preventing the
+            # "Queue Finished shown while music is still audible" experience.
+            # We re-check current() after the sleep — a concurrent /play during
+            # this window means a new song is starting; don't leave VC in that case.
+            await asyncio.sleep(2.0)
+            if get_current(chat_id) is not None or get_queue(chat_id):
+                return  # New song added during drain — stay in VC
             try:
                 if call_py:
-                    await call_py.leave_group_call(chat_id)
+                    await asyncio.wait_for(
+                        call_py.leave_group_call(chat_id), timeout=5.0
+                    )
             except Exception:
                 pass
             msg = _np_message.pop(chat_id, None)
@@ -693,13 +713,48 @@ async def _stream_song_video_with_fallback(
                 "☁️ Cloud host — vplay falling back to audio mode (CDN blocks video DASH) | %d",
                 chat_id,
             )
+            # VPLAY CLOUD FIX: If song.url is a video-format FIFO pipe (started
+            # with is_video=True), clean it up and resolve a fresh audio-only
+            # stream. Playing a video+audio FIFO via audio-only MediaStream wastes
+            # bandwidth (full video download) and causes ffmpeg to demux an
+            # unneeded video track — root cause of audio distortion on cloud.
+            from helpers.youtube import cleanup_temp_file as _ctf, get_stream as _gs_audio
+            audio_url = song.url
+            if song.url and "/apex_pipe_" in song.url:
+                _old_pipe = song.url
+                cleanup_in_bg = asyncio.create_task(
+                    asyncio.get_event_loop().run_in_executor(None, _ctf, _old_pipe)
+                )
+                try:
+                    _wp = song.webpage_url or song.url
+                    _au, _, _dur2, _hdrs2 = await _gs_audio(
+                        _wp, is_video=False, force_refresh=True
+                    )
+                    if _au:
+                        audio_url = _au
+                        song.http_headers = _hdrs2 or {}
+                        if _dur2:
+                            song.duration = _dur2
+                        log.info("☁️ vplay: swapped video pipe → audio-only stream | %d", chat_id)
+                    else:
+                        log.debug("vplay audio re-resolve returned empty — using original url")
+                except Exception as _fe:
+                    log.debug("vplay audio fallback re-resolve failed: %s", _fe)
+                finally:
+                    try:
+                        await asyncio.wait_for(cleanup_in_bg, timeout=1.0)
+                    except Exception:
+                        pass
+
+            ffparams = _ffmpeg_params(audio_url)
             audio_stream = MediaStream(
-                song.url,
+                audio_url,
                 audio_parameters  = AudioQuality.STUDIO,
                 ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
             song.is_video = False
+            song.url = audio_url
             await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
             return
 
@@ -956,6 +1011,10 @@ async def np_callback(client: Client, query: CallbackQuery):
         await _play_next(chat_id, force=True)  # force=True: bypass grace period for manual skip
 
     elif action == "stop":
+        # Cancel any in-progress early VC join task for this chat
+        _jt = _active_join_tasks.pop(chat_id, None)
+        if _jt and not _jt.done():
+            _jt.cancel()
         clear_queue(chat_id)
         set_current(chat_id, None)
         _loop.pop(chat_id, None)
@@ -963,11 +1022,13 @@ async def np_callback(client: Client, query: CallbackQuery):
         _start_time.pop(chat_id, None)
         _stream_changed_at.pop(chat_id, None)
         _extra_cache.pop(chat_id, None)
+        _stream_retries.pop(chat_id, None)
+        _silence_playing.pop(chat_id, None)
         _np_message.pop(chat_id, None)
         _play_next_locks.pop(chat_id, None)
         if call_py:
             try:
-                await call_py.leave_group_call(chat_id)
+                await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=5.0)
             except Exception:
                 pass
         await query.answer("⏹ Stopped.")
@@ -1044,6 +1105,11 @@ async def play(client: Client, message: Message):
     join_task: asyncio.Task | None = None
     if current is None and call_py:
         join_task = asyncio.create_task(_join_vc_early(chat_id))
+        _active_join_tasks[chat_id] = join_task
+        def _clear_join_play(t, _cid=chat_id):
+            if _active_join_tasks.get(_cid) is t:
+                _active_join_tasks.pop(_cid, None)
+        join_task.add_done_callback(_clear_join_play)
 
     search_task = asyncio.create_task(search_and_resolve(query))
     adder_task  = asyncio.create_task(_safe_get_adder(chat_id))
@@ -1169,6 +1235,11 @@ async def vplay(client: Client, message: Message):
     join_task: asyncio.Task | None = None
     if current is None and call_py:
         join_task = asyncio.create_task(_join_vc_early(chat_id))
+        _active_join_tasks[chat_id] = join_task
+        def _clear_join_vplay(t, _cid=chat_id):
+            if _active_join_tasks.get(_cid) is t:
+                _active_join_tasks.pop(_cid, None)
+        join_task.add_done_callback(_clear_join_vplay)
 
     search_task = asyncio.create_task(search_and_resolve(query, video=True))
     adder_task  = asyncio.create_task(_safe_get_adder(chat_id))
@@ -1308,15 +1379,26 @@ async def skip(_, message: Message):
 @bot.on_message(filters.command(["stop", "end"]) & filters.group)
 async def stop(_, message: Message):
     chat_id = message.chat.id
+    # Cancel any in-progress early VC join so it can't re-enter the call
+    # after /stop clears state (would leave _silence_playing True → future
+    # stream_end events silently dropped → bot frozen muted in VC).
+    _jt = _active_join_tasks.pop(chat_id, None)
+    if _jt and not _jt.done():
+        _jt.cancel()
     clear_queue(chat_id)
     set_current(chat_id, None)
     _loop.pop(chat_id, None)
+    _paused.pop(chat_id, None)
     _start_time.pop(chat_id, None)
     _stream_changed_at.pop(chat_id, None)
+    _extra_cache.pop(chat_id, None)
+    _stream_retries.pop(chat_id, None)
+    _silence_playing.pop(chat_id, None)
+    _np_message.pop(chat_id, None)
     _play_next_locks.pop(chat_id, None)
     if call_py:
         try:
-            await call_py.leave_group_call(chat_id)
+            await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=5.0)
         except Exception:
             pass
     await message.reply(
