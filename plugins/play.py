@@ -40,13 +40,25 @@ from helpers.decorators import admin_only
 log = logging.getLogger("ApexBot.play")
 
 # ── Per-chat state ────────────────────────────────────────────────────────────
-_loop:            dict[int, bool]     = {}
-_paused:          dict[int, bool]     = {}   # UI-only: drives Pause/Resume button label
-_volume:          dict[int, int]      = {}
-_start_time:      dict[int, float]    = {}   # epoch when current song started
-_np_message:      dict[int, Message]  = {}   # last sent now-playing message, for in-place edits
-_extra_cache:     dict[int, str]      = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
-_silence_playing: dict[int, bool]     = {}
+_loop:            dict[int, bool]          = {}
+_paused:          dict[int, bool]          = {}   # UI-only: drives Pause/Resume button label
+_volume:          dict[int, int]           = {}
+_start_time:      dict[int, float]         = {}   # epoch when current song started
+_np_message:      dict[int, Message]       = {}   # last sent now-playing message, for in-place edits
+_extra_cache:     dict[int, str]           = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
+_silence_playing: dict[int, bool]          = {}
+_play_next_locks: dict[int, asyncio.Lock]  = {}
+# ↑ MEMORY/R14 FIX: per-chat mutex for _play_next.
+#
+# Root cause: when a pipe stream ends prematurely (CDN block on Heroku),
+# NTgCalls emits multiple stream_end events in rapid succession for the same
+# chat.  Each event dispatches _play_next concurrently — every concurrent call
+# detects "elapsed < 30 s" and launches its own yt-dlp download process for
+# the same URL.  With 8-10 parallel yt-dlp workers downloading a 4-6 MB audio
+# file, the dyno's memory spikes to 1.5 GB+ → R14 (quota exceeded) → restart.
+#
+# Fix: each chat_id gets a single asyncio.Lock.  If _play_next is already
+# running for that chat, subsequent calls skip immediately instead of stacking.
 # ↑ SILENCE RACE FIX: True while the instant-join silence stream is active.
 #
 # Root cause: NTgCalls reads local MP3 files faster than real-time during
@@ -382,6 +394,23 @@ async def _fetch_autoplay_song(chat_id: int, prev: Song | None) -> Song | None:
 
 
 async def _play_next(chat_id: int):
+    # ── MEMORY / R14 FIX: per-chat mutex ───────────────────────────────────────
+    # NTgCalls can fire multiple stream_end events in quick succession for the
+    # same chat (pipe-fail scenario on Heroku CDN block).  Without a lock every
+    # concurrent call enters the pipe-retry path and spawns its own yt-dlp
+    # process → 8-10 parallel downloads → 1.5 GB RAM → R14 crash.
+    # If _play_next is already running for this chat, skip the duplicate call.
+    if chat_id not in _play_next_locks:
+        _play_next_locks[chat_id] = asyncio.Lock()
+    lock = _play_next_locks[chat_id]
+    if lock.locked():
+        log.debug("_play_next already running for %d — dropping duplicate stream_end", chat_id)
+        return
+    async with lock:
+        await _play_next_inner(chat_id)
+
+
+async def _play_next_inner(chat_id: int):
     try:
         prev = get_current(chat_id)
         elapsed = time.time() - _start_time.get(chat_id, 0.0)
@@ -667,6 +696,7 @@ async def np_callback(client: Client, query: CallbackQuery):
         _start_time.pop(chat_id, None)
         _extra_cache.pop(chat_id, None)
         _np_message.pop(chat_id, None)
+        _play_next_locks.pop(chat_id, None)
         if call_py:
             try:
                 await call_py.leave_group_call(chat_id)
@@ -1014,6 +1044,7 @@ async def stop(_, message: Message):
     set_current(chat_id, None)
     _loop.pop(chat_id, None)
     _start_time.pop(chat_id, None)
+    _play_next_locks.pop(chat_id, None)
     if call_py:
         try:
             await call_py.leave_group_call(chat_id)
