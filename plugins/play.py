@@ -657,7 +657,13 @@ if call_py:
         # the real song as soon as the URL is ready.  Calling _play_next here
         # would pop an empty queue → leave_group_call → bot leaves VC → then
         # _stream_song has to rejoin 0.2 s later, causing a blip.
-        if _silence_playing.pop(cid, False):
+        if _silence_playing.get(cid, False):
+            # BUG FIX: Use .get() not .pop() — NTgCalls fires multiple stream_end
+            # events for the same silence stream (we saw 3-4 in logs: 06:41:28).
+            # pop() removes the key on first hit; subsequent events see False and
+            # fall through to _play_next → empty queue → bot leaves VC prematurely.
+            # .get() keeps the flag set until _stream_song explicitly clears it
+            # via _silence_playing.pop(chat_id, None) after change_stream returns.
             log.debug("⏩ stream_end for silence ignored — real song pending | %d", cid)
             return
         await _play_next(cid)
