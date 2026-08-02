@@ -47,6 +47,23 @@ _start_time: dict[int, float]    = {}   # epoch when current song started
 _np_message: dict[int, Message]  = {}   # last sent now-playing message, for in-place edits
 _extra_cache: dict[int, str]     = {}   # cached "UP NEXT" / "AUTOPLAY SUGGESTIONS" block
 
+# ── BUG FIX: premature stream_end retry ───────────────────────────────────────
+# ntgcalls streams cloud/CDN-blocked songs through a one-shot FIFO pipe (see
+# helpers/youtube._start_pipe_download). yt-dlp's startup (PO-token, cookies,
+# extractor init) can take several seconds before the first audio bytes are
+# available. If ntgcalls' internal ffmpeg reader gives up on the FIFO before
+# that (its own "shell_reader.cpp: Reached end of the file" retries), the
+# writer thread's next write raises a broken-pipe error and pytgcalls fires
+# stream_end almost instantly — long before the song could have actually
+# finished. Without this guard, on_stream_end treated that as "song over" and
+# jumped straight to "Queue Finished" without ever playing audio. Track how
+# long the current song has actually been streaming and, if stream_end fires
+# suspiciously fast, re-resolve a fresh pipe/stream and retry the same song
+# a bounded number of times before giving up and advancing normally.
+_stream_retries: dict[int, int]  = {}
+_PREMATURE_END_THRESHOLD = 3.0   # seconds — below this, stream_end is treated as a failed pipe, not a finished song
+_MAX_STREAM_RETRIES      = 2
+
 # Support link from config
 try:
     from config import SUPPORT_CHAT as _SUPPORT
@@ -373,6 +390,11 @@ async def _play_next(chat_id: int):
         if not next_song and await _safe_get_autoplay(chat_id):
             next_song = await _fetch_autoplay_song(chat_id, prev)
 
+        # A genuinely new song is about to play (or the queue is ending) —
+        # the premature-stream_end retry budget only applies to the song
+        # that just failed, not whatever plays next.
+        _stream_retries.pop(chat_id, None)
+
         if not next_song:
             set_current(chat_id, None)
             _start_time.pop(chat_id, None)
@@ -511,11 +533,72 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
         await call_py.change_stream(chat_id, stream)
 
 
+async def _retry_premature_stream(chat_id: int, song: Song) -> bool:
+    """
+    Re-resolve a FRESH stream/pipe for `song` and restart playback in place.
+
+    The stale `song.url` from the failed attempt is a one-shot FIFO path
+    that has already been torn down (see helpers/youtube._start_pipe_download's
+    cleanup in its `finally` block) — reusing it would just fail again.
+    Returns True if a retry attempt was launched, False if re-resolution
+    failed (caller should then fall back to advancing the queue normally).
+    """
+    from helpers.youtube import get_stream
+
+    target_url = song.webpage_url or song.url
+    try:
+        stream_url, _audio_url, dur, http_headers = await get_stream(
+            target_url, is_video=song.is_video
+        )
+    except Exception as exc:
+        log.warning("Premature-end retry: get_stream failed for %r: %s", target_url[:80], exc)
+        return False
+
+    if not stream_url:
+        log.warning("Premature-end retry: get_stream returned empty URL for %r", target_url[:80])
+        return False
+
+    song.url = stream_url
+    song.http_headers = http_headers or {}
+    if dur:
+        song.duration = dur
+
+    if song.is_video:
+        await _stream_song_video_with_fallback(chat_id, song, already_in_vc=True)
+    else:
+        await _stream_song(chat_id, song, already_in_vc=True)
+    await _refresh_np_message(chat_id, song)
+    return True
+
+
 # Register stream-end handler
 if call_py:
     @call_py.on_update(tgcalls_filters.stream_end())
     async def on_stream_end(_, update):
-        await _play_next(update.chat_id)
+        chat_id = update.chat_id
+        song = get_current(chat_id)
+        started_at = _start_time.get(chat_id)
+        elapsed = (time.time() - started_at) if started_at else None
+
+        if (
+            song is not None
+            and elapsed is not None
+            and elapsed < _PREMATURE_END_THRESHOLD
+            and _stream_retries.get(chat_id, 0) < _MAX_STREAM_RETRIES
+        ):
+            _stream_retries[chat_id] = _stream_retries.get(chat_id, 0) + 1
+            log.warning(
+                "⚠️ stream_end fired after only %.1fs for chat %d — likely a "
+                "broken FIFO pipe, not a finished song. Retrying (%d/%d): %s",
+                elapsed, chat_id, _stream_retries[chat_id], _MAX_STREAM_RETRIES,
+                song.title[:60],
+            )
+            if await _retry_premature_stream(chat_id, song):
+                return
+            log.warning("Premature-end retry failed for chat %d — advancing queue instead.", chat_id)
+
+        _stream_retries.pop(chat_id, None)
+        await _play_next(chat_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
