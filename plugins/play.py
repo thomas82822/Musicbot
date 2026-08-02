@@ -521,6 +521,19 @@ async def _play_next_inner(chat_id: int):
         log.error("_play_next error: %s", e)
 
 
+def _ffmpeg_params(url: str) -> str:
+    """
+    Return FFmpeg reconnect flags ONLY for HTTP/HTTPS streams.
+    LOCAL FILE FIX: -reconnect_streamed causes FFmpeg to hang indefinitely
+    when the input is a local file path (no network to reconnect to).
+    yt-dlp downloads to /tmp/apex_dl_xxx/audio.mp4 on cloud hosts — passing
+    reconnect flags to those paths is the root cause of the /play freeze.
+    """
+    if url.startswith("http://") or url.startswith("https://"):
+        return "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    return ""
+
+
 async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
     """
     Start or change-stream to `song`.
@@ -537,21 +550,24 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
 
-        reconnect = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        # LOCAL FILE FIX: reconnect flags are for HTTP streams only.
+        # On cloud hosts yt-dlp downloads to a local temp file; passing
+        # -reconnect_streamed to a local path hangs FFmpeg indefinitely.
+        ffparams = _ffmpeg_params(song.url)
 
         if song.is_video:
             stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
                 video_parameters  = VideoQuality.SD_480p,
-                ffmpeg_parameters = reconnect,
+                ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
         else:
             stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
-                ffmpeg_parameters = reconnect,
+                ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
 
@@ -562,23 +578,16 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
         # suppress stale "Reached end of file" events from the old stream.
         _stream_changed_at[chat_id] = time.time()
 
-        # ── SILENCE RACE FIX (corrected placement) ──────────────────────────
-        # The silence MP3 is consumed by ntgcalls faster than real-time
-        # (~1.2 s for a 4-s file).  Its stream_end event is queued in the
-        # asyncio event loop while we are still inside `await change_stream()`.
-        # If we clear _silence_playing BEFORE that await, on_stream_end runs
-        # during the await, sees the flag as False, and calls _play_next() →
-        # empty queue → "Queue Finished" after just one second.
-        #
-        # Clearing AFTER change_stream returns means the flag stays True for
-        # the entire duration of the await.  Any queued silence stream_end that
-        # runs while we are inside change_stream() will still see True and be
-        # correctly ignored.  Only stream_end events fired after this line
-        # belong to the real song.
-        _silence_playing.pop(chat_id, None)
-
     except Exception as e:
         log.error("_stream_song error in %s: %s", chat_id, e)
+    finally:
+        # ── SILENCE RACE FIX (finally block) ────────────────────────────────
+        # Moved to finally so _silence_playing is ALWAYS cleared even when
+        # an exception propagates — mirrors the _stream_song_video_with_fallback
+        # pattern.  Previously inside try: an exception in _try_play_or_change
+        # would skip this line, leaving _silence_playing[chat_id]=True forever
+        # and silently dropping all future stream_end events → bot frozen muted.
+        _silence_playing.pop(chat_id, None)
 
 
 async def _stream_song_video_with_fallback(
@@ -602,7 +611,8 @@ async def _stream_song_video_with_fallback(
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
 
-        reconnect = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        # LOCAL FILE FIX: reconnect flags are for HTTP streams only.
+        ffparams = _ffmpeg_params(song.url)
 
         # BUG FIX: Cloud hosts (Heroku/Railway/Render) cannot download YouTube
         # DASH video+audio streams — the CDN blocks fragment fetches, so
@@ -624,7 +634,7 @@ async def _stream_song_video_with_fallback(
             audio_stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
-                ffmpeg_parameters = reconnect,
+                ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
             song.is_video = False
@@ -635,7 +645,7 @@ async def _stream_song_video_with_fallback(
             song.url,
             audio_parameters  = AudioQuality.STUDIO,
             video_parameters  = VideoQuality.SD_480p,
-            ffmpeg_parameters = reconnect,
+            ffmpeg_parameters = ffparams,
             headers           = song.http_headers,
         )
 
@@ -650,7 +660,7 @@ async def _stream_song_video_with_fallback(
             audio_stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
-                ffmpeg_parameters = reconnect,
+                ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
             song.is_video = False
@@ -668,22 +678,49 @@ async def _stream_song_video_with_fallback(
         _silence_playing.pop(chat_id, None)
 
 
+# TIMEOUT FIX: pytgcalls play()/change_stream() can hang indefinitely when
+# FFmpeg fails to open the stream (bad URL, local file with wrong params, etc.).
+# Without a timeout the entire /play coroutine freezes — bot stays in VC but
+# never actually streams, and all further commands are blocked.
+_PLAY_TIMEOUT = 20.0   # seconds before we give up on a single play/change attempt
+
+
 async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False):
     """
     Try play(); if already in VC, fall back to change_stream().
     prefer_change=True → attempt change_stream first (when early join is known
     to have succeeded) so we skip the guaranteed-to-fail play() round-trip.
+
+    Each call is wrapped in a 20 s timeout so a hung pytgcalls/NTgCalls call
+    never freezes the bot permanently.
     """
     if prefer_change:
         try:
-            await call_py.change_stream(chat_id, stream)
+            await asyncio.wait_for(
+                call_py.change_stream(chat_id, stream),
+                timeout=_PLAY_TIMEOUT,
+            )
             return
+        except asyncio.TimeoutError:
+            log.warning("_try_play_or_change: change_stream timed out for %d — retrying via play()", chat_id)
         except Exception:
             pass  # Wasn't in VC after all — try play() below
     try:
-        await call_py.play(chat_id, stream)
+        await asyncio.wait_for(
+            call_py.play(chat_id, stream),
+            timeout=_PLAY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("_try_play_or_change: play() timed out for %d — trying change_stream()", chat_id)
+        await asyncio.wait_for(
+            call_py.change_stream(chat_id, stream),
+            timeout=_PLAY_TIMEOUT,
+        )
     except Exception:
-        await call_py.change_stream(chat_id, stream)
+        await asyncio.wait_for(
+            call_py.change_stream(chat_id, stream),
+            timeout=_PLAY_TIMEOUT,
+        )
 
 
 # Register stream-end handler
