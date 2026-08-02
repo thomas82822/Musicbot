@@ -1,7 +1,7 @@
 {
-  "last_sync": 1785640425,
-  "last_sync_iso": "2026-08-02 03:13:45 UTC",
-  "reason": "shutdown",
+  "last_sync": 1785640752,
+  "last_sync_iso": "2026-08-02 03:19:12 UTC",
+  "reason": "auto-timer",
   "counts": {
     "users": 0,
     "groups": 0,
