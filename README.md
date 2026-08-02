@@ -185,7 +185,7 @@ Owner DM mein `/start` → **Bot Branding** button se ye sab change karo — **b
 
 ### Method 1 — Heroku (One-Click Deploy) ⭐ Recommended
 
-[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/thomas91929/Musicbot)
+[![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/thomas82822/Musicbot)
 
 > **Heroku deploy karne ke baad ye env vars zaroor set karo:**
 > `API_ID`, `API_HASH`, `BOT_TOKEN`, `SESSION_STRING`, `OWNER_ID`
