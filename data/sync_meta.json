@@ -1,0 +1,18 @@
+{
+  "last_sync": 1785636116,
+  "last_sync_iso": "2026-08-02 02:01:56 UTC",
+  "reason": "shutdown",
+  "counts": {
+    "users": 0,
+    "groups": 0,
+    "economy": 0,
+    "gbans": 0,
+    "warns": 0,
+    "notes": 0,
+    "word_filters": 0,
+    "welcome_settings": 0,
+    "bot_settings": 0,
+    "broadcast_targets": 0,
+    "play_history": 0
+  }
+}
