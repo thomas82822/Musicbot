@@ -1498,6 +1498,15 @@ def _start_pipe_download(url: str, audio_only: bool) -> str:
                         _PIPE_CONNECT_TIMEOUT,
                         url[:60],
                     )
+                    # BUG FIX: mark this URL's pipe as failed so _play_next_inner
+                    # knows to retry via local download instead of showing
+                    # "Queue Finished" immediately.  Without this, _had_pipe_failure()
+                    # returned False for reader-timeout failures (the rc!=0 path that
+                    # normally increments _pipe_failures was never reached), causing
+                    # the retry guard in _play_next_inner to skip re-resolve entirely.
+                    with _pipe_states_lock:
+                        _pipe_failures[url] = max(1, _pipe_failures.get(url, 0) + 1)
+                    log.debug("📌 Pipe marked failed (reader timeout) — will retry via local-dl | %s", url[:80])
                     # Unblock _blocking_open by briefly opening a dummy reader.
                     try:
                         _dummy = os.open(pipe_path, os.O_RDONLY | os.O_NONBLOCK)
