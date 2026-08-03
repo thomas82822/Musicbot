@@ -196,6 +196,18 @@ async def _join_vc_early(chat_id: int) -> bool:
     if not silence:
         return False
     try:
+        # CHANNEL_INVALID FIX: pytgcalls calls channels.GetChannels internally
+        # when joining a VC. If the assistant client hasn't seen this chat yet
+        # (fresh restart, first /play ever in this group), its InputPeer cache is
+        # empty and Telegram returns [400 CHANNEL_INVALID].
+        # Pre-resolve the peer here so pytgcalls can always find the channel.
+        from clients import assistant as _asst
+        if _asst is not None:
+            try:
+                await _asst.get_chat(chat_id)
+            except Exception as _pre:
+                log.debug("Early join peer pre-resolution for %d: %s", chat_id, _pre)
+
         from pytgcalls.types import MediaStream, AudioQuality
         sstream = MediaStream(silence, audio_parameters=AudioQuality.STUDIO)
         # Mark silence as active BEFORE play() so on_stream_end can see it
@@ -832,7 +844,26 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
 
     Each call is wrapped in a 20 s timeout so a hung pytgcalls/NTgCalls call
     never freezes the bot permanently.
+
+    CHANNEL_INVALID ROOT FIX: pytgcalls internally calls channels.GetChannels
+    when joining or switching streams in a voice chat. If the assistant client
+    has never seen this chat (fresh restart / first /play in a group), the
+    InputPeer is not in its cache → Telegram returns [400 CHANNEL_INVALID].
+    Pre-resolving via assistant.get_chat() fixes the cache before every call.
+    This is the root cause of ALL reported VC failures:
+      • Bot doesn't join VC on /play
+      • FIFO reader timeout — NTgCalls never started so no reader opened pipe
+      • /skip and /stop silently fail — same GetChannels needed for leave/change
+      • Bot stays in VC after queue ends — leave_group_call fails silently too
     """
+    # Peer resolution — must run before EVERY pytgcalls call for this chat.
+    try:
+        from clients import assistant as _asst
+        if _asst is not None:
+            await _asst.get_chat(chat_id)
+    except Exception as _pre_err:
+        log.debug("Peer pre-resolution for %d: %s", chat_id, _pre_err)
+
     _change_stream = getattr(call_py, 'change_stream', None)
 
     if prefer_change and _change_stream:
