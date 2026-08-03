@@ -591,11 +591,22 @@ async def _play_next_inner(chat_id: int):
                 return  # New song added during drain — stay in VC
             try:
                 if call_py:
+                    # LEAVE FIX: Pre-resolve peer so pytgcalls can call
+                    # channels.GetChannels without CHANNEL_INVALID.  Same fix
+                    # applied in _try_play_or_change for play()/change_stream().
+                    # Without this, leave_group_call silently fails → bot stays
+                    # in VC forever after the queue empties.
+                    try:
+                        from clients import assistant as _asst_leave
+                        if _asst_leave is not None:
+                            await _asst_leave.get_chat(chat_id)
+                    except Exception as _pre_leave:
+                        log.debug("Leave peer pre-resolution for %d: %s", chat_id, _pre_leave)
                     await asyncio.wait_for(
                         call_py.leave_group_call(chat_id), timeout=5.0
                     )
-            except Exception:
-                pass
+            except Exception as _leave_err:
+                log.warning("leave_group_call failed for %d: %s", chat_id, _leave_err)
             msg = _np_message.pop(chat_id, None)
             if msg:
                 try:
@@ -609,7 +620,10 @@ async def _play_next_inner(chat_id: int):
                     pass
             return
 
-        await _stream_song(chat_id, next_song)
+        # already_in_vc=True: bot is already in the call when queue advances.
+        # Skips the guaranteed-to-fail play() attempt and goes straight to
+        # change_stream() — eliminates the 20s _PLAY_TIMEOUT hang on skip.
+        await _stream_song(chat_id, next_song, already_in_vc=True)
         await _refresh_np_message(chat_id, next_song)
     except Exception as e:
         log.error("_play_next error: %s", e)
