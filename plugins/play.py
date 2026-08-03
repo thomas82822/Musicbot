@@ -149,6 +149,60 @@ _SILENCE_PATH: str | None = None
 _SILENCE_LOCK = asyncio.Lock()
 
 
+async def _seed_assistant_peer(chat_id: int) -> None:
+    """
+    ROOT FIX for [400 CHANNEL_INVALID] on every pytgcalls call.
+
+    Problem:
+      pytgcalls internally calls channels.GetChannels before play(),
+      change_stream(), and leave_group_call().  That MTProto call requires
+      an InputPeerChannel with the correct access_hash.  The assistant
+      (userbot) is a fresh account — its Pyrogram peer cache starts empty.
+      resolve_peer() and get_chat() BOTH call channels.GetChannels to
+      populate the cache, but since the assistant hasn't been added to the
+      group, Telegram returns [400 CHANNEL_INVALID] → cache stays empty →
+      every subsequent pytgcalls call also fails with CHANNEL_INVALID.
+
+    Fix:
+      The BOT client (bot token) IS a member of every group it manages.
+      bot.resolve_peer(chat_id) succeeds because Telegram trusts the bot
+      and returns InputPeerChannel(channel_id, access_hash).
+      We then write that access_hash directly into the assistant's Pyrogram
+      storage so the assistant can use it without making its own network call.
+      After this, pytgcalls can resolve the channel peer from local cache.
+    """
+    from clients import bot as _bot, assistant as _asst
+    if _bot is None or _asst is None:
+        return
+    try:
+        from pyrogram.raw.types import InputPeerChannel, InputPeerChat
+        peer = await _bot.resolve_peer(chat_id)
+        if isinstance(peer, InputPeerChannel):
+            await _asst.storage.update_peers(
+                [(peer.channel_id, peer.access_hash, "channel", None, None)]
+            )
+            log.info(
+                "✅ Seeded assistant peer cache for %d (channel_id=%d)",
+                chat_id, peer.channel_id,
+            )
+        elif isinstance(peer, InputPeerChat):
+            # Regular group — no access_hash needed, but mark it known
+            await _asst.storage.update_peers(
+                [(peer.chat_id, 0, "chat", None, None)]
+            )
+            log.info("✅ Seeded assistant peer cache for %d (chat)", chat_id)
+        else:
+            log.warning(
+                "Unexpected peer type %s for %d — VC ops may fail",
+                type(peer).__name__, chat_id,
+            )
+    except Exception as _err:
+        log.warning(
+            "Peer cache seed FAILED for %d: %s — VC join will likely fail",
+            chat_id, _err,
+        )
+
+
 async def _get_silence_file() -> str | None:
     """
     Create (once) a 3-second PCM silence MP3 so the bot can join VC
@@ -196,17 +250,8 @@ async def _join_vc_early(chat_id: int) -> bool:
     if not silence:
         return False
     try:
-        # CHANNEL_INVALID FIX: pytgcalls calls channels.GetChannels internally
-        # when joining a VC. If the assistant client hasn't seen this chat yet
-        # (fresh restart, first /play ever in this group), its InputPeer cache is
-        # empty and Telegram returns [400 CHANNEL_INVALID].
-        # Pre-resolve the peer here so pytgcalls can always find the channel.
-        from clients import assistant as _asst
-        if _asst is not None:
-            try:
-                await _asst.resolve_peer(chat_id)
-            except Exception as _pre:
-                log.warning("Early join peer resolve FAILED for %d: %s", chat_id, _pre)
+        # Seed assistant peer cache from bot client before pytgcalls call.
+        await _seed_assistant_peer(chat_id)
 
         from pytgcalls.types import MediaStream, AudioQuality
         sstream = MediaStream(silence, audio_parameters=AudioQuality.STUDIO)
@@ -591,17 +636,8 @@ async def _play_next_inner(chat_id: int):
                 return  # New song added during drain — stay in VC
             try:
                 if call_py:
-                    # LEAVE FIX: Pre-resolve peer so pytgcalls can call
-                    # channels.GetChannels without CHANNEL_INVALID.  Same fix
-                    # applied in _try_play_or_change for play()/change_stream().
-                    # Without this, leave_group_call silently fails → bot stays
-                    # in VC forever after the queue empties.
-                    try:
-                        from clients import assistant as _asst_leave
-                        if _asst_leave is not None:
-                            await _asst_leave.resolve_peer(chat_id)
-                    except Exception as _pre_leave:
-                        log.warning("Leave peer resolve FAILED for %d: %s", chat_id, _pre_leave)
+                    # Seed assistant peer cache from bot client before leave call.
+                    await _seed_assistant_peer(chat_id)
                     await asyncio.wait_for(
                         call_py.leave_group_call(chat_id), timeout=5.0
                     )
@@ -870,17 +906,8 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
       • /skip and /stop silently fail — same GetChannels needed for leave/change
       • Bot stays in VC after queue ends — leave_group_call fails silently too
     """
-    # Peer resolution — must run before EVERY pytgcalls call for this chat.
-    # ROOT FIX: resolve_peer() forces Pyrogram to fetch+cache the InputPeer
-    # (access_hash + peer type) that pytgcalls needs for channels.GetChannels.
-    # get_chat() fetches the full Chat object but doesn't reliably populate
-    # the InputPeer cache, so CHANNEL_INVALID was still raised after get_chat.
-    try:
-        from clients import assistant as _asst
-        if _asst is not None:
-            await _asst.resolve_peer(chat_id)
-    except Exception as _pre_err:
-        log.warning("Peer pre-resolution FAILED for %d: %s — VC ops may fail", chat_id, _pre_err)
+    # Seed assistant peer cache from bot client before pytgcalls call.
+    await _seed_assistant_peer(chat_id)
 
     _change_stream = getattr(call_py, 'change_stream', None)
 
