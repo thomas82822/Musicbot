@@ -204,9 +204,9 @@ async def _join_vc_early(chat_id: int) -> bool:
         from clients import assistant as _asst
         if _asst is not None:
             try:
-                await _asst.get_chat(chat_id)
+                await _asst.resolve_peer(chat_id)
             except Exception as _pre:
-                log.debug("Early join peer pre-resolution for %d: %s", chat_id, _pre)
+                log.warning("Early join peer resolve FAILED for %d: %s", chat_id, _pre)
 
         from pytgcalls.types import MediaStream, AudioQuality
         sstream = MediaStream(silence, audio_parameters=AudioQuality.STUDIO)
@@ -599,9 +599,9 @@ async def _play_next_inner(chat_id: int):
                     try:
                         from clients import assistant as _asst_leave
                         if _asst_leave is not None:
-                            await _asst_leave.get_chat(chat_id)
+                            await _asst_leave.resolve_peer(chat_id)
                     except Exception as _pre_leave:
-                        log.debug("Leave peer pre-resolution for %d: %s", chat_id, _pre_leave)
+                        log.warning("Leave peer resolve FAILED for %d: %s", chat_id, _pre_leave)
                     await asyncio.wait_for(
                         call_py.leave_group_call(chat_id), timeout=5.0
                     )
@@ -871,12 +871,16 @@ async def _try_play_or_change(chat_id: int, stream, prefer_change: bool = False)
       • Bot stays in VC after queue ends — leave_group_call fails silently too
     """
     # Peer resolution — must run before EVERY pytgcalls call for this chat.
+    # ROOT FIX: resolve_peer() forces Pyrogram to fetch+cache the InputPeer
+    # (access_hash + peer type) that pytgcalls needs for channels.GetChannels.
+    # get_chat() fetches the full Chat object but doesn't reliably populate
+    # the InputPeer cache, so CHANNEL_INVALID was still raised after get_chat.
     try:
         from clients import assistant as _asst
         if _asst is not None:
-            await _asst.get_chat(chat_id)
+            await _asst.resolve_peer(chat_id)
     except Exception as _pre_err:
-        log.debug("Peer pre-resolution for %d: %s", chat_id, _pre_err)
+        log.warning("Peer pre-resolution FAILED for %d: %s — VC ops may fail", chat_id, _pre_err)
 
     _change_stream = getattr(call_py, 'change_stream', None)
 
