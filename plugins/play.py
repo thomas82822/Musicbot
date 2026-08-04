@@ -203,6 +203,64 @@ async def _seed_assistant_peer(chat_id: int) -> None:
         )
 
 
+async def _ensure_assistant_in_group(chat_id: int) -> bool:
+    """
+    FIX 4: Auto-invite assistant to group if not already a member.
+
+    When the assistant (userbot) is not in the group, pytgcalls cannot join
+    the voice chat → [400 CHANNEL_INVALID] on all VC calls.
+
+    Fix flow:
+      1. Check if assistant is already a member.
+      2. If not — generate a one-time invite link via bot client.
+      3. Have assistant join via that link.
+      4. If join fails (e.g., private group needs admin approval) — send a
+         message to the group with the assistant's @username so admins can
+         add it manually.
+
+    Returns True if assistant is (now) in the group.
+    """
+    from clients import bot as _bot, assistant as _asst
+    if _bot is None or _asst is None:
+        return False
+
+    # Step 1: check membership
+    try:
+        _me = await _asst.get_me()
+        await _bot.get_chat_member(chat_id, _me.id)
+        return True   # already a member
+    except Exception:
+        pass
+
+    # Step 2: create an invite link and have the assistant join
+    try:
+        _me = await _asst.get_me()
+        invite = await _bot.create_chat_invite_link(chat_id, member_limit=1)
+        await _asst.join_chat(invite.invite_link)
+        # Seed peer cache now that assistant is in the group
+        await _seed_assistant_peer(chat_id)
+        log.info("✅ Assistant auto-joined chat %d via invite link", chat_id)
+        return True
+    except Exception as _join_err:
+        log.warning("Assistant auto-join failed for %d: %s", chat_id, _join_err)
+
+    # Step 3: tell the group to add the assistant manually
+    try:
+        _me = await _asst.get_me()
+        asst_mention = f"@{_me.username}" if _me.username else f"`{_me.id}`"
+        await _bot.send_message(
+            chat_id,
+            f"<blockquote>⚠️ <b>Assistant Bot Not in Group</b></blockquote>\n\n"
+            f"Music play karne ke liye assistant bot {asst_mention} ko is group mein "
+            f"add karein aur <b>Manage Voice Chats</b> permission dein.\n\n"
+            f"Add hone ke baad dubara /play karein. 🎵",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    return False
+
+
 async def _get_silence_file() -> str | None:
     """
     Create (once) a 3-second PCM silence MP3 so the bot can join VC
@@ -535,8 +593,13 @@ async def _play_next(chat_id: int, force: bool = False):
         _play_next_locks[chat_id] = asyncio.Lock()
     lock = _play_next_locks[chat_id]
     if lock.locked():
-        log.debug("_play_next already running for %d — dropping duplicate stream_end", chat_id)
-        return
+        if not force:
+            # Automatic stream_end event: drop duplicate to avoid parallel yt-dlp spawns
+            log.debug("_play_next already running for %d — dropping duplicate stream_end", chat_id)
+            return
+        # force=True means user-triggered (skip / stop button / /skip / /end command).
+        # Do NOT silently drop — wait for the current operation to finish, then act.
+        log.debug("_play_next force=True: waiting for ongoing operation in %d", chat_id)
     async with lock:
         await _play_next_inner(chat_id)
 
@@ -659,7 +722,11 @@ async def _play_next_inner(chat_id: int):
         # already_in_vc=True: bot is already in the call when queue advances.
         # Skips the guaranteed-to-fail play() attempt and goes straight to
         # change_stream() — eliminates the 20s _PLAY_TIMEOUT hang on skip.
-        await _stream_song(chat_id, next_song, already_in_vc=True)
+        # Route video vs audio songs correctly so /play songs never play as video.
+        if next_song.is_video:
+            await _stream_song_video_with_fallback(chat_id, next_song, already_in_vc=True)
+        else:
+            await _stream_song(chat_id, next_song, already_in_vc=True)
         await _refresh_np_message(chat_id, next_song)
     except Exception as e:
         log.error("_play_next error: %s", e)
@@ -710,6 +777,38 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
 
         set_current(chat_id, song)
         _start_time[chat_id] = time.time()
+
+        # ── PLAYLIST / UNRESOLVED URL FIX ────────────────────────────────────
+        # Playlist songs are queued without a resolved stream URL (url="" or
+        # url=webpage_url).  MediaStream cannot play a YouTube page URL —
+        # it needs the actual CDN URL or FIFO pipe path.  Detect this and
+        # resolve lazily here, before the stream attempt.  Regular /play songs
+        # already have resolved URLs so this is a no-op for them.
+        _needs_resolve = (
+            not song.url                          # empty — playlist song
+            or "youtube.com/watch" in song.url    # raw YouTube page URL
+            or "youtu.be/" in song.url            # short YouTube URL
+            or song.url == song.webpage_url        # url not yet resolved
+        )
+        if _needs_resolve and song.webpage_url:
+            from helpers.youtube import get_stream as _yt_get_stream
+            _ref = song.webpage_url
+            try:
+                log.debug("_stream_song: resolving stream URL for playlist song | %s", _ref[:80])
+                _resolved, _, _dur, _hdrs = await _yt_get_stream(
+                    _ref,
+                    is_video=song.is_video,
+                )
+                if _resolved:
+                    song.url = _resolved
+                    song.http_headers = _hdrs or {}
+                    if _dur and not song.duration:
+                        song.duration = _dur
+                    log.debug("_stream_song: resolved → %s", song.url[:60])
+                else:
+                    log.warning("_stream_song: get_stream returned empty for %s", _ref[:80])
+            except Exception as _re:
+                log.warning("_stream_song: lazy URL resolve failed: %s — will try raw URL", _re)
 
         # LOCAL FILE FIX: reconnect flags are for HTTP streams only.
         # On cloud hosts yt-dlp downloads to a local temp file; passing
@@ -1121,9 +1220,10 @@ async def np_callback(client: Client, query: CallbackQuery):
         _play_next_locks.pop(chat_id, None)
         if call_py:
             try:
-                await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=5.0)
-            except Exception:
-                pass
+                await _seed_assistant_peer(chat_id)
+                await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=8.0)
+            except Exception as _cb_stop_err:
+                log.warning("leave_group_call failed for Stop button in %d: %s", chat_id, _cb_stop_err)
         await query.answer("⏹ Stopped.")
         try:
             await query.message.edit(
@@ -1188,6 +1288,13 @@ async def play(client: Client, message: Message):
     chat_id    = message.chat.id
     chat_title = message.chat.title or ""
     current    = get_current(chat_id)
+
+    # ── FIX 4: Ensure assistant is in the group BEFORE trying to join VC ───
+    # If assistant is not a group member, pytgcalls fails with CHANNEL_INVALID.
+    # _ensure_assistant_in_group tries to auto-join via invite link; if that
+    # fails it sends a helpful message asking admins to add the assistant.
+    if current is None and call_py:
+        asyncio.create_task(_ensure_assistant_in_group(chat_id))
 
     # ── INSTANT: fire VC join + search + adder ALL simultaneously ───
     # 1. Early VC join (silence trick) — bot is in VC before search finishes.
@@ -1491,9 +1598,11 @@ async def stop(_, message: Message):
     _play_next_locks.pop(chat_id, None)
     if call_py:
         try:
-            await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=5.0)
-        except Exception:
-            pass
+            # Seed peer cache BEFORE leave so assistant knows this channel
+            await _seed_assistant_peer(chat_id)
+            await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=8.0)
+        except Exception as _stop_err:
+            log.warning("leave_group_call failed for /stop in %d: %s", chat_id, _stop_err)
     await message.reply(
         "<blockquote>⏹ <b>Playback Stopped</b></blockquote>\n\n"
         "Queue cleared. Use /play to start again!",

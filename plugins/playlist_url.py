@@ -124,9 +124,12 @@ async def playlist_cmd(client: Client, message: Message):
 
         added = 0
         for e in entries:
+            # FIX: url = "" (not the webpage URL) so _stream_song lazy-resolves
+            # the actual audio CDN / FIFO pipe URL when the song is played.
+            # webpage_url holds the YouTube watch URL for yt-dlp to resolve later.
             s = Song(
                 title        = e["title"],
-                url          = e["url"],
+                url          = "",           # resolved lazily in _stream_song
                 webpage_url  = e["url"],
                 requested_by = requester,
                 requested_by_id = user_id,
@@ -141,35 +144,30 @@ async def playlist_cmd(client: Client, message: Message):
 
         # Auto-start if nothing playing
         if call_py and get_current(chat_id) is None and added > 0:
-            first = entries[0]
             await msg.edit(
-                f"<blockquote>🎵 <b>Playlist Queued!</b></blockquote>\n\n"
-                f"📋 <b>{added}</b> songs added to queue.\n"
-                f"▶️ Starting first song…",
+                f"<blockquote>🎵 <b>Playlist Started!</b></blockquote>\n\n"
+                f"📋 <b>{added}</b> songs queued.\n"
+                f"▶️ Starting playback…",
                 parse_mode=enums.ParseMode.HTML,
             )
-            # Trigger play of first song from queue via existing mechanism
-            from helpers.youtube import search_and_resolve
-            first_song = await search_and_resolve(first["url"])
-            if first_song:
-                first_song.requested_by    = requester
-                first_song.requested_by_id = user_id
-                from helpers.queue import set_current
-                from plugins.play import _stream_song, _send_playing_card
-                set_current(chat_id, first_song)
-                chat_title = message.chat.title or ""
-                await asyncio.gather(
-                    _stream_song(chat_id, first_song),
-                    _send_playing_card(chat_id, first_song,
-                                       reply_to=message,
-                                       chat_title=chat_title),
+            # FIX: Use _play_next(force=True) instead of manually resolving the
+            # first song.  The old approach kept the first song in the queue AND
+            # set it as current → song played twice.  _play_next pops the first
+            # song from queue, lazy-resolves its URL via _stream_song, and plays.
+            try:
+                from plugins.play import (
+                    _ensure_assistant_in_group,
+                    _join_vc_early,
+                    _play_next,
                 )
-            else:
-                await msg.edit(
-                    f"<blockquote>📋 <b>Playlist Queued — {added} songs</b></blockquote>\n\n"
-                    f"Use /play to start playing!",
-                    parse_mode=enums.ParseMode.HTML,
-                )
+                # Ensure assistant is in group before joining VC
+                await _ensure_assistant_in_group(chat_id)
+                # Join VC early (silence trick) so stream switches instantly
+                await _join_vc_early(chat_id)
+                # Pop first song, lazy-resolve URL, stream it
+                await _play_next(chat_id, force=True)
+            except Exception as _ap_err:
+                log.warning("playlist auto-start failed for %d: %s", chat_id, _ap_err)
         else:
             pos_info = f"Starting from position #{get_current(chat_id) and 'next' or 1}" if get_current(chat_id) else ""
             await msg.edit(
@@ -216,10 +214,11 @@ async def playlist_cmd(client: Client, message: Message):
         added = 0
         for sd in songs:
             try:
+                _song_url = sd.get("url", "")
                 s = Song(
                     title           = sd.get("title", "Unknown"),
-                    url             = sd.get("url", ""),
-                    webpage_url     = sd.get("url", ""),
+                    url             = "",           # resolved lazily in _stream_song
+                    webpage_url     = _song_url,    # YouTube watch URL for yt-dlp
                     requested_by    = requester,
                     requested_by_id = user_id,
                 )

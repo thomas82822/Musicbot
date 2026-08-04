@@ -887,7 +887,10 @@ async def get_autoplay(chat_id: int) -> bool:
             "SELECT enabled FROM autoplay_settings WHERE chat_id=?", (chat_id,)
         ) as cur:
             row = await cur.fetchone()
-            return bool(row and row[0])
+            if row is None:
+                # Default: autoplay ON — bot keeps playing related songs automatically
+                return True
+            return bool(row[0])
 
 
 async def set_autoplay(chat_id: int, enabled: bool):
