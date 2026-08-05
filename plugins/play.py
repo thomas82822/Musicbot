@@ -50,6 +50,42 @@ _silence_playing: dict[int, bool]          = {}
 _play_next_locks:    dict[int, asyncio.Lock]  = {}
 _stream_changed_at:  dict[int, float]         = {}
 _active_join_tasks:  dict[int, asyncio.Task]  = {}   # per-chat early-join tasks; cancelled by /stop
+_play_token:         dict[int, int]           = {}
+# ↑ STOP/SKIP RACE FIX: monotonically increasing per-chat "generation" token.
+#
+# Root cause: /play and _play_next kick off network work (search, stream-URL
+# resolve, FIFO/local download) that can take 1-5+ seconds, and only AFTER
+# that awaits does the code actually call _try_play_or_change() to start
+# audio in the voice chat. If the user hits /stop, /skip, /end, or the Stop
+# button while that resolve is still in flight, the old code had no way to
+# cancel it — the pending task finished its resolve later and happily called
+# play()/change_stream() anyway, rejoining the VC and starting audio AFTER
+# the user had already asked it to stop. That is exactly the "skip/stop/end
+# song keeps playing" bug.
+#
+# Fix: every command that starts a NEW playback attempt grabs a fresh token
+# via _bump_token() and threads it through to _stream_song /
+# _stream_song_video_with_fallback. Right before actually calling
+# _try_play_or_change() (the only place that touches the live VC stream),
+# the token is re-checked with _token_valid(). If a newer command
+# (stop/skip/end/another play) has bumped the token in the meantime, the
+# stale attempt aborts silently instead of starting/］changing audio.
+# /stop, /skip, /end and the Stop/Skip buttons all bump the token too, so
+# any in-flight attempt from before the command is immediately invalidated.
+
+
+def _bump_token(chat_id: int) -> int:
+    """Start a new playback generation for this chat; invalidates older ones."""
+    tok = _play_token.get(chat_id, 0) + 1
+    _play_token[chat_id] = tok
+    return tok
+
+
+def _token_valid(chat_id: int, token: int | None) -> bool:
+    """True if `token` is still the current generation (or no token was given)."""
+    if token is None:
+        return True
+    return _play_token.get(chat_id, 0) == token
 # ↑ MEMORY/R14 FIX: per-chat mutex + stream-transition cooldown for _play_next.
 #
 # Root cause A (fixed): NTgCalls fires 8-10 stream_end events in rapid
@@ -723,11 +759,20 @@ async def _play_next_inner(chat_id: int):
         # Skips the guaranteed-to-fail play() attempt and goes straight to
         # change_stream() — eliminates the 20s _PLAY_TIMEOUT hang on skip.
         # Route video vs audio songs correctly so /play songs never play as video.
+        #
+        # STOP/SKIP RACE FIX: this call itself is often triggered by /skip,
+        # /stop+autoplay-retrigger, or a natural stream_end — bump the token
+        # here so this attempt becomes the new authoritative generation. If
+        # ANOTHER skip/stop arrives while _stream_song is still resolving the
+        # next song's URL, that newer bump invalidates this one before it can
+        # actually start audio.
+        my_token = _bump_token(chat_id)
         if next_song.is_video:
-            await _stream_song_video_with_fallback(chat_id, next_song, already_in_vc=True)
+            await _stream_song_video_with_fallback(chat_id, next_song, already_in_vc=True, token=my_token)
         else:
-            await _stream_song(chat_id, next_song, already_in_vc=True)
-        await _refresh_np_message(chat_id, next_song)
+            await _stream_song(chat_id, next_song, already_in_vc=True, token=my_token)
+        if _token_valid(chat_id, my_token):
+            await _refresh_np_message(chat_id, next_song)
     except Exception as e:
         log.error("_play_next error: %s", e)
 
@@ -762,13 +807,18 @@ def _ffmpeg_params(url: str) -> str:
     return ""
 
 
-async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
+async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False, token: int | None = None):
     """
     Start or change-stream to `song`.
     already_in_vc=True  → skip the failed play() attempt and go straight to
                           change_stream(); saves one round-trip when the
                           silence-trick early join is known to have succeeded.
     already_in_vc=False → try play() first, fall back to change_stream() on error.
+    token → playback generation from _bump_token(). If /stop, /skip, /end or a
+            newer /play bump the token while this coroutine is still resolving
+            the stream (network/download can take seconds), the actual VC
+            play/change call is skipped so a stale song can never start
+            playing after the user already asked to stop it.
     """
     if not call_py:
         return
@@ -824,12 +874,28 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False):
                 headers           = song.http_headers,
             )
         else:
+            # AUDIO/VIDEO MIX-UP FIX: video_flags=IGNORE forces this stream to
+            # NEVER carry a video track, no matter what URL yt-dlp resolved.
+            # Without this, MediaStream's default video_flags=AUTO_DETECT lets
+            # pytgcalls probe song.url for a video track and stream it if found
+            # — some yt-dlp fallback paths (e.g. "bestaudio/best" degrading to
+            # a muxed "best" format when no pure audio-only stream exists) can
+            # hand back a combined audio+video URL even for an audio request.
+            # That is the root cause of "/play plays like /vplay" — the bot was
+            # never told this stream must be audio-only at the pytgcalls layer.
             stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
                 ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
+                video_flags       = MediaStream.Flags.IGNORE,
             )
+
+        # STOP/SKIP RACE FIX: bail out if a newer command (stop/skip/end/play)
+        # invalidated this playback generation while we were resolving above.
+        if not _token_valid(chat_id, token):
+            log.debug("_stream_song: stale token for %d — dropping (user already stopped/skipped)", chat_id)
+            return
 
         await _try_play_or_change(chat_id, stream, prefer_change=already_in_vc)
 
@@ -855,11 +921,14 @@ async def _stream_song_video_with_fallback(
     song: Song,
     timeout: float = 15.0,
     already_in_vc: bool = False,
+    token: int | None = None,
 ):
     """
     Like _stream_song but for video mode.
     If streaming hangs for more than `timeout` seconds, falls back to audio-only.
     already_in_vc=True skips the failed play() attempt (same as _stream_song).
+    token → see _stream_song docstring; aborts a stale attempt instead of
+            starting playback after the user already stopped/skipped.
     """
     if not call_py:
         return
@@ -930,9 +999,13 @@ async def _stream_song_video_with_fallback(
                 audio_parameters  = AudioQuality.STUDIO,
                 ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
+                video_flags       = MediaStream.Flags.IGNORE,
             )
             song.is_video = False
             song.url = audio_url
+            if not _token_valid(chat_id, token):
+                log.debug("_stream_song_video_with_fallback: stale token for %d — dropping", chat_id)
+                return
             await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
             return
 
@@ -944,6 +1017,12 @@ async def _stream_song_video_with_fallback(
             headers           = song.http_headers,
         )
 
+        # STOP/SKIP RACE FIX: bail out if a newer command (stop/skip/end/play)
+        # invalidated this playback generation while we were resolving above.
+        if not _token_valid(chat_id, token):
+            log.debug("_stream_song_video_with_fallback: stale token for %d — dropping", chat_id)
+            return
+
         try:
             await asyncio.wait_for(
                 _try_play_or_change(chat_id, video_stream, prefer_change=already_in_vc),
@@ -952,11 +1031,15 @@ async def _stream_song_video_with_fallback(
             log.debug("✅ Video stream started for %d", chat_id)
         except asyncio.TimeoutError:
             log.warning("⚠️ vplay timed out (%ds) for %d — falling back to audio", timeout, chat_id)
+            if not _token_valid(chat_id, token):
+                log.debug("_stream_song_video_with_fallback: stale token for %d — dropping fallback", chat_id)
+                return
             audio_stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
                 ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
+                video_flags       = MediaStream.Flags.IGNORE,
             )
             song.is_video = False
             await _try_play_or_change(chat_id, audio_stream, prefer_change=already_in_vc)
@@ -1092,11 +1175,14 @@ async def _retry_premature_stream(chat_id: int, song: Song) -> bool:
     if dur:
         song.duration = dur
 
+    # STOP/SKIP RACE FIX: claim a fresh generation for this retry attempt too.
+    my_token = _bump_token(chat_id)
     if song.is_video:
-        await _stream_song_video_with_fallback(chat_id, song, already_in_vc=True)
+        await _stream_song_video_with_fallback(chat_id, song, already_in_vc=True, token=my_token)
     else:
-        await _stream_song(chat_id, song, already_in_vc=True)
-    await _refresh_np_message(chat_id, song)
+        await _stream_song(chat_id, song, already_in_vc=True, token=my_token)
+    if _token_valid(chat_id, my_token):
+        await _refresh_np_message(chat_id, song)
     return True
 
 
@@ -1199,6 +1285,8 @@ async def np_callback(client: Client, query: CallbackQuery):
             return await query.answer("❌ Voice chat not available.", show_alert=True)
         if not song:
             return await query.answer("Nothing to skip.", show_alert=True)
+        # STOP/SKIP RACE FIX: see /skip command handler for rationale.
+        _bump_token(chat_id)
         await query.answer("⏭ Skipped.")
         await _play_next(chat_id, force=True)  # force=True: bypass grace period for manual skip
 
@@ -1207,6 +1295,8 @@ async def np_callback(client: Client, query: CallbackQuery):
         _jt = _active_join_tasks.pop(chat_id, None)
         if _jt and not _jt.done():
             _jt.cancel()
+        # STOP/SKIP RACE FIX: see /stop command handler for rationale.
+        _bump_token(chat_id)
         clear_queue(chat_id)
         set_current(chat_id, None)
         _loop.pop(chat_id, None)
@@ -1377,9 +1467,15 @@ async def play(client: Client, message: Message):
                 except (asyncio.TimeoutError, Exception):
                     pass
 
+        # STOP/SKIP RACE FIX: claim a fresh playback generation for this /play.
+        # If /stop, /skip, /end or another /play happen while _stream_song is
+        # still resolving the stream URL below, this token goes stale and the
+        # actual VC play() call is skipped instead of starting audio late.
+        my_token = _bump_token(chat_id)
+
         # Stream + send card concurrently; skip failed play() if already in VC
         await asyncio.gather(
-            _stream_song(chat_id, song, already_in_vc=joined_early),
+            _stream_song(chat_id, song, already_in_vc=joined_early, token=my_token),
             _send_playing_card(
                 chat_id, song, reply_to=message,
                 chat_title=chat_title, adder_name=adder_name,
@@ -1501,10 +1597,13 @@ async def vplay(client: Client, message: Message):
                 except (asyncio.TimeoutError, Exception):
                     pass
 
+        # STOP/SKIP RACE FIX: claim a fresh playback generation for this /vplay.
+        my_token = _bump_token(chat_id)
+
         # Stream with video + 15s timeout + audio fallback; skip play() if in VC
         await asyncio.gather(
             _stream_song_video_with_fallback(
-                chat_id, song, timeout=15.0, already_in_vc=joined_early
+                chat_id, song, timeout=15.0, already_in_vc=joined_early, token=my_token
             ),
             _send_playing_card(
                 chat_id, song, reply_to=message,
@@ -1569,6 +1668,11 @@ async def skip(_, message: Message):
             pass
     for _ in range(n - 1):
         pop_queue(chat_id)
+    # STOP/SKIP RACE FIX: invalidate whatever playback generation is currently
+    # resolving/playing (e.g. the song being skipped may itself still be
+    # mid-resolve from a very recent /play). _play_next below grabs its own
+    # fresh token for the next song, so this only kills the stale one.
+    _bump_token(chat_id)
     await message.reply(
         f"<blockquote>⏭ <b>Skipped {n} song{'s' if n > 1 else ''}!</b></blockquote>",
         parse_mode=enums.ParseMode.HTML,
@@ -1585,6 +1689,12 @@ async def stop(_, message: Message):
     _jt = _active_join_tasks.pop(chat_id, None)
     if _jt and not _jt.done():
         _jt.cancel()
+    # STOP/SKIP RACE FIX: invalidate any in-flight /play, /vplay or
+    # _play_next attempt for this chat. Without this, a song whose stream
+    # URL was still resolving when /stop was pressed would finish resolving
+    # a moment later and call play()/change_stream() anyway — rejoining the
+    # VC and playing audio right after the user asked it to stop.
+    _bump_token(chat_id)
     clear_queue(chat_id)
     set_current(chat_id, None)
     _loop.pop(chat_id, None)
