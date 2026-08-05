@@ -738,7 +738,7 @@ async def _play_next_inner(chat_id: int):
                     # Seed assistant peer cache from bot client before leave call.
                     await _seed_assistant_peer(chat_id)
                     await asyncio.wait_for(
-                        call_py.leave_group_call(chat_id), timeout=5.0
+                        call_py.leave_call(chat_id), timeout=5.0
                     )
             except Exception as _leave_err:
                 log.warning("leave_group_call failed for %d: %s", chat_id, _leave_err)
@@ -869,7 +869,7 @@ async def _stream_song(chat_id: int, song: Song, already_in_vc: bool = False, to
             stream = MediaStream(
                 song.url,
                 audio_parameters  = AudioQuality.STUDIO,
-                video_parameters  = VideoQuality.SD_480p,
+                video_parameters  = VideoQuality.HD_720p,
                 ffmpeg_parameters = ffparams,
                 headers           = song.http_headers,
             )
@@ -1012,7 +1012,7 @@ async def _stream_song_video_with_fallback(
         video_stream = MediaStream(
             song.url,
             audio_parameters  = AudioQuality.STUDIO,
-            video_parameters  = VideoQuality.SD_480p,
+            video_parameters  = VideoQuality.HD_720p,
             ffmpeg_parameters = ffparams,
             headers           = song.http_headers,
         )
@@ -1311,7 +1311,7 @@ async def np_callback(client: Client, query: CallbackQuery):
         if call_py:
             try:
                 await _seed_assistant_peer(chat_id)
-                await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=8.0)
+                await asyncio.wait_for(call_py.leave_call(chat_id), timeout=8.0)
             except Exception as _cb_stop_err:
                 log.warning("leave_group_call failed for Stop button in %d: %s", chat_id, _cb_stop_err)
         await query.answer("⏹ Stopped.")
@@ -1425,7 +1425,7 @@ async def play(client: Client, message: Message):
         if join_task:
             join_task.cancel()
             try:
-                await call_py.leave_group_call(chat_id)
+                await call_py.leave_call(chat_id)
             except Exception:
                 pass
         return await msg.edit(
@@ -1561,7 +1561,7 @@ async def vplay(client: Client, message: Message):
         if join_task:
             join_task.cancel()
             try:
-                await call_py.leave_group_call(chat_id)
+                await call_py.leave_call(chat_id)
             except Exception:
                 pass
         return await msg.edit(
@@ -1710,7 +1710,7 @@ async def stop(_, message: Message):
         try:
             # Seed peer cache BEFORE leave so assistant knows this channel
             await _seed_assistant_peer(chat_id)
-            await asyncio.wait_for(call_py.leave_group_call(chat_id), timeout=8.0)
+            await asyncio.wait_for(call_py.leave_call(chat_id), timeout=8.0)
         except Exception as _stop_err:
             log.warning("leave_group_call failed for /stop in %d: %s", chat_id, _stop_err)
     await message.reply(
